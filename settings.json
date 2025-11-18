@@ -1,0 +1,42 @@
+{
+  "mqtt": {
+    "broker": "192.168.1.100",
+    "port": 1883,
+    "username": null,
+    "password": null,
+    "topic_prefix": "home/pump"
+  },
+  "led_detection": {
+    "color_lower": [35, 100, 100],
+    "color_upper": [85, 255, 255],
+    "min_area": 50
+  },
+  "gpio": {
+    "ir_led_pins": [26, 27]
+  },
+  "timing": {
+    "led_check_interval_seconds": 300,
+    "temp_check_interval_pump_on": 300,
+    "temp_check_interval_pump_off": 1800,
+    "image_retention_hours": 4
+  },
+  "storage": {
+    "image_dir": "images",
+    "log_file": "pump_monitor.log",
+    "state_file": "state.json"
+  },
+  "gauge": {
+    "min_temp": 0,
+    "max_temp": 80,
+    "arc_degrees": 270,
+    "zero_angle": 225,
+    "min_radius": 30,
+    "max_radius": 200,
+    "needle_color_range": {
+      "black": [[0, 0, 0], [180, 255, 80]],
+      "red": [[0, 100, 100], [10, 255, 255]],
+      "white": [[0, 0, 200], [180, 30, 255]]
+    },
+    "calibration_file": "gauge_calibration.json"
+  }
+}

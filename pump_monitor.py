@@ -6,6 +6,7 @@ Uses 100% local computer vision - no API costs
 Smart scheduling: checks temp frequently when pump ON, less when OFF
 """
 
+import argparse
 from picamera2 import Picamera2
 import RPi.GPIO as GPIO
 import paho.mqtt.client as mqtt
@@ -20,48 +21,192 @@ import sys
 # Import gauge reader
 sys.path.append(str(Path(__file__).parent))
 try:
-    from gauge_reader import read_gauge, load_calibration
+    from gauge_reader import read_gauge, load_calibration, apply_settings as apply_gauge_settings
 except ImportError:
     print("ERROR: gauge_reader.py not found in same directory!")
     print("Make sure gauge_reader.py is in ~/pump-monitor/")
     sys.exit(1)
 
 # ============================================================================
-# CONFIGURATION - EDIT THESE VALUES  
+# CONFIGURATION
 # ============================================================================
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("settings.json")
 
-# MQTT Configuration
-MQTT_BROKER = "192.168.1.100"  # YOUR NAS IP ADDRESS
-MQTT_PORT = 1883
-MQTT_USER = None  # Your MQTT username or None
-MQTT_PASS = None  # Your MQTT password or None
-MQTT_TOPIC_PREFIX = "home/pump"
+DEFAULT_SETTINGS = {
+    "mqtt": {
+        "broker": "192.168.1.100",
+        "port": 1883,
+        "username": None,
+        "password": None,
+        "topic_prefix": "home/pump"
+    },
+    "led_detection": {
+        "color_lower": [35, 100, 100],
+        "color_upper": [85, 255, 255],
+        "min_area": 50
+    },
+    "gpio": {
+        "ir_led_pins": [26, 27]
+    },
+    "timing": {
+        "led_check_interval_seconds": 300,
+        "temp_check_interval_pump_on": 300,
+        "temp_check_interval_pump_off": 1800,
+        "image_retention_hours": 4
+    },
+    "storage": {
+        "image_dir": "images",
+        "log_file": "pump_monitor.log",
+        "state_file": "state.json"
+    },
+    "gauge": {
+        "min_temp": 0,
+        "max_temp": 80,
+        "arc_degrees": 270,
+        "zero_angle": 225,
+        "min_radius": 30,
+        "max_radius": 200,
+        "needle_color_range": {
+            "black": [[0, 0, 0], [180, 255, 80]],
+            "red": [[0, 100, 100], [10, 255, 255]],
+            "white": [[0, 0, 200], [180, 30, 255]]
+        },
+        "calibration_file": "gauge_calibration.json"
+    }
+}
+CONFIG: dict = {}
+CONFIG_DIR = DEFAULT_CONFIG_PATH.parent
+CURRENT_CONFIG_PATH = None
 
-# Green LED Detection (for pump status)
-LED_COLOR_LOWER = np.array([35, 100, 100])  # HSV lower bound for green
-LED_COLOR_UPPER = np.array([85, 255, 255])  # HSV upper bound for green
-LED_MIN_AREA = 50  # Minimum pixel area for LED detection
 
-# GPIO Configuration
-IR_LED_PINS = [17, 27]  # IR LED GPIO pins
+def _normalize_config_path(candidate):
+    path = Path(candidate).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    else:
+        path = path.resolve()
+    return path
 
-# Timing Configuration
-LED_CHECK_INTERVAL_SECONDS = 300  # Check LED every 5 minutes
-TEMP_CHECK_INTERVAL_PUMP_ON = 300  # Check temp every 5 min when pump ON
-TEMP_CHECK_INTERVAL_PUMP_OFF = 1800  # Check temp every 30 min when pump OFF
-IMAGE_RETENTION_HOURS = 4  # Keep images for 4 hours
 
-# Storage Configuration
-IMAGE_DIR = Path("/home/pi/pump-monitor/images")
-LOG_FILE = Path("/home/pi/pump-monitor/pump_monitor.log")
-STATE_FILE = Path("/home/pi/pump-monitor/state.json")
+def merge_settings(defaults, overrides):
+    result = {}
+    keys = set(defaults.keys()) | set(overrides.keys())
+    for key in keys:
+        default_value = defaults.get(key)
+        override_value = overrides.get(key)
+
+        if isinstance(default_value, dict):
+            override_dict = override_value if isinstance(override_value, dict) else {}
+            result[key] = merge_settings(default_value, override_dict)
+        elif override_value is not None:
+            result[key] = override_value
+        else:
+            result[key] = default_value
+
+    return result
+
+
+def _apply_config_dict(settings, base_dir):
+    global MQTT_BROKER
+    global MQTT_PORT
+    global MQTT_USER
+    global MQTT_PASS
+    global MQTT_TOPIC_PREFIX
+    global LED_COLOR_LOWER
+    global LED_COLOR_UPPER
+    global LED_MIN_AREA
+    global IR_LED_PINS
+    global LED_CHECK_INTERVAL_SECONDS
+    global TEMP_CHECK_INTERVAL_PUMP_ON
+    global TEMP_CHECK_INTERVAL_PUMP_OFF
+    global IMAGE_RETENTION_HOURS
+    global IMAGE_DIR
+    global LOG_FILE
+    global STATE_FILE
+
+    mqtt_config = settings["mqtt"]
+    led_config = settings["led_detection"]
+    gpio_config = settings["gpio"]
+    timing_config = settings["timing"]
+    storage_config = settings["storage"]
+
+    MQTT_BROKER = mqtt_config["broker"]
+    MQTT_PORT = int(mqtt_config["port"])
+    MQTT_USER = mqtt_config.get("username")
+    MQTT_PASS = mqtt_config.get("password")
+    MQTT_TOPIC_PREFIX = mqtt_config["topic_prefix"]
+
+    LED_COLOR_LOWER = np.array(led_config["color_lower"], dtype=np.uint8)
+    LED_COLOR_UPPER = np.array(led_config["color_upper"], dtype=np.uint8)
+    LED_MIN_AREA = int(led_config["min_area"])
+
+    IR_LED_PINS = [int(pin) for pin in gpio_config.get("ir_led_pins", [])]
+
+    LED_CHECK_INTERVAL_SECONDS = int(timing_config["led_check_interval_seconds"])
+    TEMP_CHECK_INTERVAL_PUMP_ON = int(timing_config["temp_check_interval_pump_on"])
+    TEMP_CHECK_INTERVAL_PUMP_OFF = int(timing_config["temp_check_interval_pump_off"])
+    IMAGE_RETENTION_HOURS = int(timing_config["image_retention_hours"])
+
+    IMAGE_DIR = _resolve_path(storage_config["image_dir"], base_dir)
+    LOG_FILE = _resolve_path(storage_config["log_file"], base_dir)
+    STATE_FILE = _resolve_path(storage_config["state_file"], base_dir)
+
+    apply_gauge_settings(settings, base_dir)
+
+
+def apply_pump_settings(settings, base_dir):
+    global CONFIG
+    global CONFIG_DIR
+
+    CONFIG_DIR = base_dir
+    CONFIG = merge_settings(DEFAULT_SETTINGS, settings)
+    _apply_config_dict(CONFIG, base_dir)
+    return CONFIG
+
+
+def _resolve_path(value, base_dir):
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = (base_dir / path).resolve()
+    return path
+
+
+def configure_from_file(config_path=None):
+    global CURRENT_CONFIG_PATH
+
+    if config_path is None:
+        path = _normalize_config_path(DEFAULT_CONFIG_PATH)
+    else:
+        path = _normalize_config_path(config_path)
+
+    with open(path, "r", encoding="utf-8") as handle:
+        overrides = json.load(handle)
+
+    apply_pump_settings(overrides, path.parent)
+    CURRENT_CONFIG_PATH = path
+    return CONFIG
+
+
+def prepare_storage():
+    if IMAGE_DIR:
+        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    if LOG_FILE:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if STATE_FILE:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+# Apply defaults at import so dependent functions have usable values
+apply_pump_settings({}, DEFAULT_CONFIG_PATH.parent)
+
+try:
+    configure_from_file(DEFAULT_CONFIG_PATH)
+except FileNotFoundError:
+    CURRENT_CONFIG_PATH = None
 
 # ============================================================================
 # SYSTEM SETUP
 # ============================================================================
-
-IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 def log(message):
     """Log message with timestamp"""
@@ -69,7 +214,11 @@ def log(message):
     log_message = f"[{timestamp}] {message}"
     print(log_message)
     
-    with open(LOG_FILE, 'a') as f:
+    if LOG_FILE is None:
+        return
+
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(log_message + '\n')
 
 # ============================================================================
@@ -85,6 +234,9 @@ def load_state():
         "led_region": None
     }
     
+    if STATE_FILE is None:
+        return default_state
+
     if STATE_FILE.exists():
         try:
             with open(STATE_FILE, 'r') as f:
@@ -99,6 +251,8 @@ def load_state():
 def save_state(state):
     """Save persistent state"""
     try:
+        if STATE_FILE is None:
+            return
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f, indent=2)
     except Exception as e:
@@ -172,6 +326,9 @@ def save_image(image, timestamp, suffix=""):
 
 def cleanup_old_images():
     """Remove images older than retention period"""
+    if IMAGE_DIR is None:
+        return
+
     cutoff_time = datetime.now() - timedelta(hours=IMAGE_RETENTION_HOURS)
     
     deleted_count = 0
@@ -448,12 +605,42 @@ def run_monitoring_cycle(camera, state, calibration):
             notes=f'Error: {str(e)}'
         )
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Monitor the pump status and temperature using local computer vision."
+    )
+    parser.add_argument(
+        "--config",
+        help="Path to settings JSON file overriding defaults"
+    )
+    return parser.parse_args()
+
 def main():
     """Main entry point"""
+
+    args = parse_args()
+
+    if args.config:
+        try:
+            configure_from_file(args.config)
+        except FileNotFoundError:
+            print(f"ERROR: Settings file not found: {args.config}")
+            sys.exit(1)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: Invalid settings file '{args.config}': {exc}")
+            sys.exit(1)
+
+    prepare_storage()
     
     log("=" * 60)
     log("PUMP MONITOR SYSTEM - FINAL VERSION")
     log("=" * 60)
+    if CURRENT_CONFIG_PATH:
+        log(f"Configuration file: {CURRENT_CONFIG_PATH}")
+    else:
+        log("Configuration: built-in defaults")
+    log(f"MQTT broker: {MQTT_BROKER}:{MQTT_PORT}")
     log(f"LED check interval: {LED_CHECK_INTERVAL_SECONDS}s ({LED_CHECK_INTERVAL_SECONDS/60} min)")
     log(f"Temp check when pump ON: {TEMP_CHECK_INTERVAL_PUMP_ON}s ({TEMP_CHECK_INTERVAL_PUMP_ON/60} min)")
     log(f"Temp check when pump OFF: {TEMP_CHECK_INTERVAL_PUMP_OFF}s ({TEMP_CHECK_INTERVAL_PUMP_OFF/60} min)")

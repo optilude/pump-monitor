@@ -5,35 +5,122 @@ Reads analog circular temperature gauge by detecting needle angle
 No AI/API required - pure computer vision
 """
 
+import argparse
 import cv2
 import numpy as np
 import json
 from pathlib import Path
 from datetime import datetime
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("settings.json")
 
-# Gauge specifications (default for 0-80°C gauge)
-GAUGE_MIN_TEMP = 0      # Temperature at start of scale (°C)
-GAUGE_MAX_TEMP = 80     # Temperature at end of scale (°C)
-GAUGE_ARC_DEGREES = 270 # Arc coverage in degrees (270° typical)
-GAUGE_ZERO_ANGLE = 225  # Angle of zero position (225° = bottom-left)
-
-# Detection parameters
-GAUGE_MIN_RADIUS = 30   # Minimum gauge radius in pixels
-GAUGE_MAX_RADIUS = 200  # Maximum gauge radius in pixels
-
-# Needle color detection ranges (HSV)
-NEEDLE_COLOR_RANGE = {
-    'black': ([0, 0, 0], [180, 255, 80]),      # Black needle
-    'red': ([0, 100, 100], [10, 255, 255]),    # Red needle
-    'white': ([0, 0, 200], [180, 30, 255])     # White needle
+DEFAULT_SETTINGS = {
+    "gauge": {
+        "min_temp": 0,
+        "max_temp": 80,
+        "arc_degrees": 270,
+        "zero_angle": 225,
+        "min_radius": 30,
+        "max_radius": 200,
+        "needle_color_range": {
+            "black": [[0, 0, 0], [180, 255, 80]],
+            "red": [[0, 100, 100], [10, 255, 255]],
+            "white": [[0, 0, 200], [180, 30, 255]]
+        },
+        "calibration_file": "gauge_calibration.json"
+    }
 }
 
-# Calibration file
-CALIBRATION_FILE = Path("/home/pi/pump-monitor/gauge_calibration.json")
+# Runtime configuration values populated from settings
+GAUGE_MIN_TEMP = DEFAULT_SETTINGS["gauge"]["min_temp"]
+GAUGE_MAX_TEMP = DEFAULT_SETTINGS["gauge"]["max_temp"]
+GAUGE_ARC_DEGREES = DEFAULT_SETTINGS["gauge"]["arc_degrees"]
+GAUGE_ZERO_ANGLE = DEFAULT_SETTINGS["gauge"]["zero_angle"]
+GAUGE_MIN_RADIUS = DEFAULT_SETTINGS["gauge"]["min_radius"]
+GAUGE_MAX_RADIUS = DEFAULT_SETTINGS["gauge"]["max_radius"]
+NEEDLE_COLOR_RANGE = {}
+CALIBRATION_FILE = Path(DEFAULT_SETTINGS["gauge"]["calibration_file"])
+CURRENT_CONFIG_PATH = None
+
+
+def _resolve_path(value, base_dir):
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = (base_dir / path).resolve()
+    return path
+
+
+def apply_settings(settings, base_dir):
+    """Merge gauge settings from config into module globals."""
+
+    global GAUGE_MIN_TEMP
+    global GAUGE_MAX_TEMP
+    global GAUGE_ARC_DEGREES
+    global GAUGE_ZERO_ANGLE
+    global GAUGE_MIN_RADIUS
+    global GAUGE_MAX_RADIUS
+    global NEEDLE_COLOR_RANGE
+    global CALIBRATION_FILE
+
+    gauge_settings = DEFAULT_SETTINGS["gauge"].copy()
+    incoming = settings.get("gauge", {})
+
+    for key, value in incoming.items():
+        gauge_settings[key] = value
+
+    GAUGE_MIN_TEMP = gauge_settings["min_temp"]
+    GAUGE_MAX_TEMP = gauge_settings["max_temp"]
+    GAUGE_ARC_DEGREES = gauge_settings["arc_degrees"]
+    GAUGE_ZERO_ANGLE = gauge_settings["zero_angle"]
+    GAUGE_MIN_RADIUS = gauge_settings["min_radius"]
+    GAUGE_MAX_RADIUS = gauge_settings["max_radius"]
+
+    needle_colors = {}
+    for name, bounds in gauge_settings.get("needle_color_range", {}).items():
+        lower, upper = bounds
+        needle_colors[name] = (
+            np.array(lower, dtype=np.uint8),
+            np.array(upper, dtype=np.uint8)
+        )
+    NEEDLE_COLOR_RANGE = needle_colors
+
+    CALIBRATION_FILE = _resolve_path(gauge_settings["calibration_file"], base_dir)
+
+
+def _normalize_config_path(candidate):
+    path = Path(candidate).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+
+def configure_from_file(config_path=None):
+    """Load settings JSON and apply them."""
+
+    global CURRENT_CONFIG_PATH
+
+    if config_path is None:
+        path = _normalize_config_path(DEFAULT_CONFIG_PATH)
+    else:
+        path = _normalize_config_path(config_path)
+
+    with open(path, "r", encoding="utf-8") as handle:
+        settings = json.load(handle)
+
+    apply_settings(settings, path.parent)
+    CURRENT_CONFIG_PATH = path
+    return settings
+
+
+# Ensure defaults are applied at import
+apply_settings(DEFAULT_SETTINGS, DEFAULT_CONFIG_PATH.parent)
+
+try:
+    configure_from_file(DEFAULT_CONFIG_PATH)
+except FileNotFoundError:
+    CURRENT_CONFIG_PATH = None
 
 # ============================================================================
 # GAUGE DETECTION
@@ -104,6 +191,9 @@ def detect_needle(image, center, radius, needle_color='black'):
     Returns: angle in degrees (0° = right, counterclockwise) or None
     """
     
+    if needle_color not in NEEDLE_COLOR_RANGE:
+        return None
+
     # Create mask for gauge area (exclude outer edges and center)
     mask = np.zeros(image.shape[:2], dtype=np.uint8)
     cv2.circle(mask, center, int(radius * 0.9), 255, -1)
@@ -142,15 +232,15 @@ def detect_needle(image, center, radius, needle_color='black'):
     best_line = None
     min_distance = float('inf')
     
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        
+    line_segments = np.array(lines, dtype=np.int32).reshape(-1, 4)
+
+    for x1, y1, x2, y2 in line_segments:
         # Calculate distance from line to center
         distance = point_to_line_distance(center, (x1, y1), (x2, y2))
         
         if distance < min_distance:
             min_distance = distance
-            best_line = line[0]
+            best_line = (x1, y1, x2, y2)
     
     if best_line is None:
         return None
@@ -336,7 +426,14 @@ def read_gauge(image, calibration=None, debug=False):
     # Try different needle colors
     angle = None
     detected_color = None
-    for needle_color in ['black', 'red', 'white']:
+    color_candidates = ['black', 'red', 'white']
+    for extra_color in NEEDLE_COLOR_RANGE.keys():
+        if extra_color not in color_candidates:
+            color_candidates.append(extra_color)
+
+    for needle_color in color_candidates:
+        if needle_color not in NEEDLE_COLOR_RANGE:
+            continue
         angle = detect_needle(cropped, new_center, radius, needle_color)
         if angle is not None:
             detected_color = needle_color
@@ -401,45 +498,55 @@ def test_on_image(image_path):
     
     return result
 
-if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  Test reading: python3 gauge_reader.py test <image_path>")
-        print("  Calibrate: python3 gauge_reader.py calibrate <image1> <temp1> <image2> <temp2>")
-        sys.exit(1)
-    
-    command = sys.argv[1]
-    
-    if command == "test":
-        if len(sys.argv) != 3:
-            print("Usage: python3 gauge_reader.py test <image_path>")
-            sys.exit(1)
-        
-        test_on_image(sys.argv[2])
-    
-    elif command == "calibrate":
-        if len(sys.argv) != 6:
-            print("Usage: python3 gauge_reader.py calibrate <image1> <temp1> <image2> <temp2>")
-            print("Example: python3 gauge_reader.py calibrate cold.jpg 20 hot.jpg 60")
-            sys.exit(1)
-        
-        image1 = cv2.imread(sys.argv[2])
-        temp1 = float(sys.argv[3])
-        image2 = cv2.imread(sys.argv[4])
-        temp2 = float(sys.argv[5])
-        
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Read or calibrate the temperature gauge using computer vision."
+    )
+    parser.add_argument(
+        "--config",
+        help="Path to settings JSON file overriding defaults"
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    test_parser = subparsers.add_parser("test", help="Run gauge reading on an image")
+    test_parser.add_argument("image_path", help="Path to the gauge image to analyse")
+
+    calibrate_parser = subparsers.add_parser(
+        "calibrate",
+        help="Calibrate the gauge using two reference images"
+    )
+    calibrate_parser.add_argument("image1", help="Image path at temperature temp1")
+    calibrate_parser.add_argument("temp1", type=float, help="Known temperature for image1")
+    calibrate_parser.add_argument("image2", help="Image path at temperature temp2")
+    calibrate_parser.add_argument("temp2", type=float, help="Known temperature for image2")
+
+    args = parser.parse_args()
+
+    if args.config:
+        try:
+            configure_from_file(args.config)
+        except FileNotFoundError:
+            parser.error(f"Settings file not found: {args.config}")
+        except json.JSONDecodeError as exc:
+            parser.error(f"Invalid settings file '{args.config}': {exc}")
+
+    if args.command == "test":
+        test_on_image(args.image_path)
+    elif args.command == "calibrate":
+        image1 = cv2.imread(str(args.image1))
+        image2 = cv2.imread(str(args.image2))
+
         if image1 is None or image2 is None:
-            print("ERROR: Could not load one or both images")
-            sys.exit(1)
-        
-        success = calibrate_gauge(image1, temp1, image2, temp2)
+            parser.error("Could not load one or both calibration images")
+
+        success = calibrate_gauge(image1, args.temp1, image2, args.temp2)
         if success:
             print("\nCalibration successful!")
         else:
             print("\nCalibration failed!")
-    
-    else:
-        print(f"Unknown command: {command}")
-        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
