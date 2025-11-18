@@ -1,4 +1,5 @@
 opencv-python
 numpy
-picamera
 paho-mqtt
+# picamera is Raspberry Pi specific — install on the Pi (Linux/ARM) only
+picamera; sys_platform == "linux"
