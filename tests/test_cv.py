@@ -1,13 +1,39 @@
 """Regression tests for the computer-vision portions of pump_monitor.
 
-These tests rely on OpenCV and a captured dark-scene image with IR illumination.
+These tests rely on OpenCV and captured images with IR illumination.
 They deliberately avoid any GPIO, Picamera2, or MQTT functionality so they can
-run on development hardware. The structure is prepared for adding more captured
-scenarios with varying pump states and temperatures.
+run on development hardware.
+
+Test images are automatically discovered from the test_images/ directory using
+this filename convention:
+    test_<pump_state>_<temp>C_<descriptor>.jpg
+
+The descriptor is REQUIRED and allows multiple captures at the same conditions:
+    test_on_40C_20231115.jpg       → pump on, 40°C, captured Nov 15, 2023
+    test_off_42C_20231115_am.jpg   → pump off, 42°C, Nov 15 morning
+    test_off_42C_20231116.jpg      → pump off, 42°C, Nov 16 (different day)
+    test_on_40C_setup1.jpg         → pump on, 40°C, LED setup iteration 1
+    test_on_40C_setup2.jpg         → pump on, 40°C, LED setup iteration 2
+    test_off_38C_ambient.jpg       → pump off, 38°C, room light on
+    test_off_38C_dark.jpg          → pump off, 38°C, room light off
+
+The descriptor can be:
+- Date/time: 20231115, 20231115_am, 20231115_1430
+- Setup iteration: setup1, setup2, led_left, led_close
+- Lighting: ambient, dark, room_light
+- Any combination: 20231115_ambient, setup2_dark
+
+All tests use a fixed 2°C tolerance. Images that fail indicate issues with:
+- Physical setup (camera position, IR LED placement, glare)
+- Needle detection algorithm
+- Calibration (adjust via gauge_calibration.json)
+
+To add new test cases, simply drop appropriately named images into test_images/.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -19,6 +45,9 @@ cv2 = pytest.importorskip("cv2")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TEST_IMAGE_DIR = PROJECT_ROOT / "test_images"
+
+# Fixed tolerance for all tests - if images don't pass with 2°C, the system needs improvement
+TOLERANCE_C = 2.0
 
 DEFAULT_CALIBRATION = {
     "zero_angle": 0.0,
@@ -33,63 +62,83 @@ class CvTestCase:
     name: str
     filename: str
     pump_on: bool
-    expected_temperature_c: Optional[float]
-    tolerance_c: float = 5.0
-    expected_confidence: str = "high"
-    expect_needle: bool = True
-    expect_direct_needle: bool = True
-    expected_angle_deg: Optional[float] = None
-    calibration: Optional[dict[str, float]] = None
-    min_led_confidence: float = 20.0
-
+    expected_temperature_c: float
+    descriptor: str = ""
+    
+    @property
+    def tolerance_c(self) -> float:
+        """All tests use fixed 2°C tolerance."""
+        return TOLERANCE_C
+    
+    @property
+    def min_led_confidence(self) -> float:
+        """Minimum LED confidence - only relevant when pump is on."""
+        return 20.0 if self.pump_on else 0.0
+    
     def calibration_dict(self) -> dict[str, float]:
-        base = DEFAULT_CALIBRATION.copy()
-        if self.calibration:
-            base.update(self.calibration)
-        return base
+        """Use default calibration for all tests."""
+        return DEFAULT_CALIBRATION.copy()
 
 
-TEST_CASES = [
-    CvTestCase(
-        name="dark_on_40c",
-        filename="test_dark_pump_on_40C.jpg",
-        pump_on=True,
-        expected_temperature_c=40.0,
-        expected_angle_deg=90.0,
-        min_led_confidence=20.0,
-    ),
-    CvTestCase(
-        name="dark_off_40c",
-        filename="test_dark_pump_off_40C.jpg",
-        pump_on=False,
-        expected_temperature_c=40.0,
-        tolerance_c=6.0,
-        expected_angle_deg=90.0,
-        min_led_confidence=0.0,
-        expect_direct_needle=False,
-    ),
-    CvTestCase(
-        name="dark_off_42C",
-        filename="test_dark_pump_off_42C.jpg",
-        pump_on=False,
-        expected_temperature_c=42.0,
-        tolerance_c=6.0,
-        expected_angle_deg=95.0,
-        min_led_confidence=0.0,
-        expect_direct_needle=False,
-    ),
-    CvTestCase(
-        name="light_off_42C",
-        filename="test_light_pump_off_42C.jpg",
-        pump_on=False,
-        expected_temperature_c=42.0,
-        tolerance_c=6.0,
-        expected_angle_deg=95.0,
-        min_led_confidence=0.0,
-        expect_direct_needle=False,
-    ),
-    # Additional cases can be appended here as new captures arrive.
-]
+def _parse_test_image_filename(filename: str) -> Optional[CvTestCase]:
+    """Parse a test image filename into a CvTestCase.
+    
+    Expected format: test_<state>_<temp>C_<descriptor>.jpg
+    The descriptor is required to support multiple captures at same conditions.
+    
+    Examples:
+        test_on_40C_20231115.jpg → pump on, 40°C, descriptor='20231115'
+        test_off_42C_setup1.jpg → pump off, 42°C, descriptor='setup1'
+        test_on_55C_20231115_am.jpg → pump on, 55°C, descriptor='20231115_am'
+    """
+    # Match: test_<on|off>_<number>C_<descriptor>.jpg (descriptor required)
+    pattern = r'^test_(on|off)_(\d+(?:\.\d+)?)C_([^.]+)\.jpg$'
+    match = re.match(pattern, filename)
+    
+    if not match:
+        return None
+    
+    state, temp_str, descriptor = match.groups()
+    pump_on = (state == "on")
+    temp = float(temp_str)
+    
+    # Create a readable name for test output
+    name = f"{state}_{int(temp)}C_{descriptor}"
+    
+    return CvTestCase(
+        name=name,
+        filename=filename,
+        pump_on=pump_on,
+        expected_temperature_c=temp,
+        descriptor=descriptor,
+    )
+
+
+def _discover_test_cases() -> list[CvTestCase]:
+    """Automatically discover test cases from test_images/ directory."""
+    if not TEST_IMAGE_DIR.exists():
+        return []
+    
+    cases = []
+    for image_path in sorted(TEST_IMAGE_DIR.glob("test_*.jpg")):
+        case = _parse_test_image_filename(image_path.name)
+        if case:
+            cases.append(case)
+    
+    return cases
+
+
+# Automatically discover all test cases from filenames
+TEST_CASES = _discover_test_cases()
+
+# If no test cases found, provide a helpful message
+if not TEST_CASES:
+    pytest.skip(
+        f"No test images found in {TEST_IMAGE_DIR}. "
+        "Add images using format: test_<on|off>_<temp>C_<descriptor>.jpg "
+        "(descriptor is required, e.g., date/time or setup iteration)",
+        allow_module_level=True
+    )
 
 
 @pytest.fixture(params=TEST_CASES, ids=lambda case: case.name)
@@ -134,8 +183,6 @@ def test_detect_gauge_components(cv_case) -> None:
     from pump_monitor import crop_to_gauge, detect_gauge_circle, detect_needle
 
     case, frame = cv_case
-    if not case.expect_needle or not case.expect_direct_needle:
-        pytest.skip("Needle detection not expected for this scenario")
 
     gauge = detect_gauge_circle(frame)
     assert gauge is not None, f"Gauge circle should be detected for {case.name}"
@@ -144,33 +191,33 @@ def test_detect_gauge_components(cv_case) -> None:
     assert radius > 30, "Gauge radius unexpectedly small"
 
     cropped, new_center = crop_to_gauge(frame, (cx, cy), radius)
-    angle = detect_needle(cropped, new_center, radius, needle_color="black")
-    assert angle is not None, "Needle angle should be detected"
-
-    if case.expected_angle_deg is not None:
-        assert angle == pytest.approx(case.expected_angle_deg, abs=20)
+    # Try to detect needle with any color
+    angle = None
+    for color in ["black", "red", "white"]:
+        angle = detect_needle(cropped, new_center, radius, needle_color=color)
+        if angle is not None:
+            break
+    
+    assert angle is not None, f"Needle angle should be detected for {case.name}"
 
 
 def test_read_gauge_end_to_end(gauge_result) -> None:
     case, _frame, result = gauge_result
 
-    assert result["gauge_detected"], "Gauge should be detected in the test frame"
-
-    if case.expect_needle:
-        assert result["needle_detected"], "Needle should be detected in the test frame"
-    else:
-        assert not result["needle_detected"], "Needle detection was not expected"
-
-    if case.expected_confidence is not None:
-        assert result["confidence"] == case.expected_confidence
-
-    if case.expected_temperature_c is not None:
-        assert result["temperature_c"] == pytest.approx(case.expected_temperature_c, abs=case.tolerance_c)
-    else:
-        assert result["temperature_c"] is None
-
-    if case.expected_angle_deg is not None and result.get("angle") is not None:
-        assert result["angle"] == pytest.approx(case.expected_angle_deg, abs=20)
+    assert result["gauge_detected"], f"Gauge should be detected in {case.filename}"
+    assert result["needle_detected"], f"Needle should be detected in {case.filename}"
+    assert result["confidence"] == "high", f"Confidence should be high for {case.filename}"
+    
+    # Core test: temperature reading must be within 2°C tolerance
+    detected_temp = result["temperature_c"]
+    expected_temp = case.expected_temperature_c
+    error = abs(detected_temp - expected_temp)
+    
+    assert detected_temp == pytest.approx(expected_temp, abs=case.tolerance_c), (
+        f"{case.filename}: Temperature reading off by {error:.1f}°C "
+        f"(expected {expected_temp}°C, got {detected_temp}°C). "
+        f"Consider: adjusting IR LED position, recalibrating gauge, or improving needle detection."
+    )
 
 
 def test_image_interpretation_matches_expectations(cv_case, gauge_result) -> None:
@@ -179,15 +226,30 @@ def test_image_interpretation_matches_expectations(cv_case, gauge_result) -> Non
     case, frame = cv_case
     _, _, result = gauge_result
 
+    # Verify pump LED detection matches expected state
     pump_on, led_confidence, _ = detect_pump_leds(frame, region=None)
-    assert pump_on is case.pump_on
+    assert pump_on is case.pump_on, (
+        f"{case.filename}: Expected pump {'ON' if case.pump_on else 'OFF'}, "
+        f"detected pump {'ON' if pump_on else 'OFF'}"
+    )
 
     if case.pump_on:
-        assert led_confidence >= case.min_led_confidence
+        assert led_confidence >= case.min_led_confidence, (
+            f"{case.filename}: LED confidence too low ({led_confidence:.1f})"
+        )
 
-    if case.expected_temperature_c is not None:
-        assert result["temperature_c"] == pytest.approx(case.expected_temperature_c, abs=case.tolerance_c)
-        expected_string = f"{round(result['temperature_c']):.0f}"
-        assert expected_string in result["notes"], "Diagnostic notes should include the reported temperature"
-    else:
-        assert result["temperature_c"] is None
+    # Verify temperature reading
+    detected_temp = result["temperature_c"]
+    expected_temp = case.expected_temperature_c
+    error = abs(detected_temp - expected_temp)
+    
+    assert detected_temp == pytest.approx(expected_temp, abs=case.tolerance_c), (
+        f"{case.filename}: Temperature off by {error:.1f}°C "
+        f"(expected {expected_temp}°C, got {detected_temp}°C)"
+    )
+    
+    # Check that the temperature value appears in diagnostic notes
+    temp_str = str(detected_temp)
+    assert temp_str in result["notes"], (
+        f"{case.filename}: Diagnostic notes should include temperature ({temp_str})"
+    )

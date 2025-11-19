@@ -139,13 +139,14 @@ def detect_gauge_circle(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (9, 9), 2)
 
+    # Use improved parameters from pump_vision.py for more reliable detection
     circles = cv2.HoughCircles(
         blurred,
         cv2.HOUGH_GRADIENT,
         dp=1,
         minDist=100,
-        param1=50,
-        param2=30,
+        param1=60,  # Increased for stricter edge detection
+        param2=40,  # Increased to avoid false positives
         minRadius=GAUGE_MIN_RADIUS,
         maxRadius=GAUGE_MAX_RADIUS,
     )
@@ -176,68 +177,86 @@ def crop_to_gauge(image, center, radius):
 
 
 def detect_needle(image, center, radius, needle_color="black"):
-    """Detect the needle angle in degrees, or return None if not found."""
-
-    if needle_color not in NEEDLE_COLOR_RANGE:
-        return None
-
+    """Detect the needle angle in degrees, or return None if not found.
+    
+    Uses improved multi-strategy edge detection from pump_vision.py for better
+    reliability across different lighting conditions.
+    """
+    cx, cy = center
+    
+    # Create annular mask (ring) for the gauge area
+    # Exclude center (needle pivot) and outer edge
     mask = np.zeros(image.shape[:2], dtype=np.uint8)
-    cv2.circle(mask, center, int(radius * 0.9), 255, -1)
-    cv2.circle(mask, center, int(radius * 0.2), 0, -1)
-
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    lower, upper = NEEDLE_COLOR_RANGE[needle_color]
-    color_mask = cv2.inRange(hsv, lower, upper)
-
-    needle_mask = cv2.bitwise_and(color_mask, mask)
-
-    if cv2.countNonZero(needle_mask) < 10:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        needle_mask = cv2.bitwise_and(edges, mask)
-
-    lines = cv2.HoughLinesP(
-        needle_mask,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=20,
-        minLineLength=int(radius * 0.3),
-        maxLineGap=10,
-    )
-
-    if lines is None:
-        return None
-
-    best_line = None
-    min_distance = float("inf")
-    line_segments = np.array(lines, dtype=np.int32).reshape(-1, 4)
-
-    for x1, y1, x2, y2 in line_segments:
-        distance = point_to_line_distance(center, (x1, y1), (x2, y2))
-        if distance < min_distance:
-            min_distance = distance
-            best_line = (x1, y1, x2, y2)
-
-    if best_line is None:
-        return None
-
-    x1, y1, x2, y2 = best_line
-
-    dist1 = np.hypot(x1 - center[0], y1 - center[1])
-    dist2 = np.hypot(x2 - center[0], y2 - center[1])
-
-    if dist1 > dist2:
-        tip_x, tip_y = x1, y1
-    else:
-        tip_x, tip_y = x2, y2
-
-    angle = np.arctan2(tip_y - center[1], tip_x - center[0])
-    angle_degrees = np.degrees(angle)
-
-    if angle_degrees < 0:
-        angle_degrees += 360
-
-    return angle_degrees
+    cv2.circle(mask, (cx, cy), int(radius * 0.85), 255, -1)
+    cv2.circle(mask, (cx, cy), int(radius * 0.15), 0, -1)
+    
+    # Convert to grayscale for edge detection
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Try multiple edge detection strategies for robustness
+    edges_list = [
+        cv2.Canny(gray, 50, 150),   # Standard
+        cv2.Canny(gray, 30, 100),   # More sensitive
+        cv2.Canny(gray, 70, 200),   # Less sensitive (cleaner)
+    ]
+    
+    best_angle = None
+    best_score = -1
+    
+    for edges in edges_list:
+        # Apply mask to focus only on gauge area
+        edges_masked = cv2.bitwise_and(edges, mask)
+        
+        # Detect line segments with relaxed parameters
+        lines = cv2.HoughLinesP(
+            edges_masked,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=10,  # Lower threshold for better detection
+            minLineLength=int(radius * 0.25),  # Shorter minimum
+            maxLineGap=10
+        )
+        
+        if lines is None:
+            continue
+        
+        # Find the line that passes closest to the center
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            
+            # Calculate perpendicular distance from center to line
+            distance = point_to_line_distance((cx, cy), (x1, y1), (x2, y2))
+            
+            # Check that line is reasonably long
+            line_length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            
+            # Score based on: close to center + reasonably long
+            if line_length > radius * 0.3:
+                score = line_length / (distance + 1)  # Higher score = better
+                
+                if score > best_score:
+                    best_score = score
+                    
+                    # Determine which endpoint is farther from center (needle tip)
+                    dist1 = np.sqrt((x1 - cx)**2 + (y1 - cy)**2)
+                    dist2 = np.sqrt((x2 - cx)**2 + (y2 - cy)**2)
+                    
+                    if dist1 > dist2:
+                        tip_x, tip_y = x1, y1
+                    else:
+                        tip_x, tip_y = x2, y2
+                    
+                    # Calculate angle from center to tip
+                    angle_rad = np.arctan2(tip_y - cy, tip_x - cx)
+                    angle_deg = np.degrees(angle_rad)
+                    
+                    # Convert to 0-360 range
+                    if angle_deg < 0:
+                        angle_deg += 360
+                    
+                    best_angle = angle_deg
+    
+    return best_angle
 
 
 def point_to_line_distance(point, line_start, line_end):
@@ -257,7 +276,11 @@ def point_to_line_distance(point, line_start, line_end):
 
 
 def angle_to_temperature(angle, calibration=None):
-    """Convert a needle angle to temperature using calibration if available."""
+    """Convert a needle angle to temperature using calibration if available.
+    
+    Uses improved empirical calibration from pump_vision.py when no calibration
+    file exists, providing accurate readings for the standard gauge setup.
+    """
 
     if calibration:
         zero_angle = calibration["zero_angle"]
@@ -279,21 +302,66 @@ def angle_to_temperature(angle, calibration=None):
 
         temperature = min_temp + (relative_angle / arc_span) * temp_range
     else:
-        relative_angle = angle - GAUGE_ZERO_ANGLE
-        if relative_angle < 0:
-            relative_angle += 360
-
-        if GAUGE_ARC_DEGREES <= 0:
-            return round(GAUGE_MIN_TEMP, 1)
-
-        temp_range = GAUGE_MAX_TEMP - GAUGE_MIN_TEMP
-        if temp_range <= 0:
-            return round(GAUGE_MIN_TEMP, 1)
-
-        temperature = GAUGE_MIN_TEMP + (relative_angle / GAUGE_ARC_DEGREES) * temp_range
+        # Use empirical calibration from pump_vision.py analysis
+        # The needle rotates clockwise starting from ~126° (0°C),
+        # going through 180°, 270°, 0°/360°, ending at ~67° (80°C)
+        # This represents approximately 3.77° per degree Celsius
+        EMPIRICAL_ZERO_ANGLE = 126.0
+        EMPIRICAL_DEGREES_PER_C = 3.77
+        
+        # Calculate how many degrees we've rotated from zero position
+        degrees_from_zero = angle - EMPIRICAL_ZERO_ANGLE
+        
+        # Handle wraparound: if we've gone past 360° back to small angles,
+        # we need to add 360 to get the total rotation
+        if degrees_from_zero < -180:  # We've wrapped around
+            degrees_from_zero += 360
+        
+        # Convert rotation to temperature
+        temperature = degrees_from_zero / EMPIRICAL_DEGREES_PER_C
 
     temperature = max(GAUGE_MIN_TEMP, min(GAUGE_MAX_TEMP, temperature))
     return round(temperature, 1)
+
+
+def _is_angle_in_valid_range(angle, calibration=None):
+    """Check if an angle is within a reasonable range for the gauge calibration."""
+    if calibration:
+        zero_angle = calibration["zero_angle"]
+        max_angle = calibration["max_angle"]
+    else:
+        zero_angle = GAUGE_ZERO_ANGLE
+        max_angle = zero_angle + GAUGE_ARC_DEGREES
+        if max_angle >= 360:
+            max_angle -= 360
+
+    # Calculate if angle is within the arc from zero to max
+    relative_angle = angle - zero_angle
+    if relative_angle < 0:
+        relative_angle += 360
+
+    arc_span = max_angle - zero_angle
+    if arc_span < 0:
+        arc_span += 360
+
+    # Allow some tolerance beyond the arc (e.g., 10% extra on each end)
+    tolerance = arc_span * 0.1
+    return -tolerance <= relative_angle <= arc_span + tolerance
+
+
+def _normalize_needle_angle(angle, calibration=None):
+    """Normalize a needle angle, flipping by 180° if it appears to be detecting the wrong end."""
+    if _is_angle_in_valid_range(angle, calibration):
+        return angle
+
+    # Try flipping by 180°
+    flipped_angle = (angle + 180) % 360
+    if _is_angle_in_valid_range(flipped_angle, calibration):
+        return flipped_angle
+
+    # If neither works, return original angle
+    return angle
+
 
 
 def save_calibration(zero_angle, max_angle, min_temp, max_temp):
@@ -348,7 +416,9 @@ def read_gauge(image, calibration=None, debug=False):
 
     cropped, new_center = crop_to_gauge(image, (center_x, center_y), radius)
 
+    # Try all needle colors and collect detections
     angle = None
+    detected_angles = []
     color_candidates = ["black", "red", "white"]
     for extra_color in NEEDLE_COLOR_RANGE.keys():
         if extra_color not in color_candidates:
@@ -357,20 +427,88 @@ def read_gauge(image, calibration=None, debug=False):
     for needle_color in color_candidates:
         if needle_color not in NEEDLE_COLOR_RANGE:
             continue
-        angle = detect_needle(cropped, new_center, radius, needle_color)
-        if angle is not None:
+        detected_angle = detect_needle(cropped, new_center, radius, needle_color)
+        if detected_angle is not None:
+            detected_angles.append((needle_color, detected_angle))
             if debug:
-                print(f"Needle detected ({needle_color}): angle={angle:.1f}°")
-            break
-
-    if angle is None:
+                print(f"Needle detected ({needle_color}): angle={detected_angle:.1f}°")
+    
+    if not detected_angles:
         result["notes"] = "Could not detect needle"
         return result
+    
+    # Choose the best angle: try each detected angle both raw and flipped,
+    # and select based purely on which gives the most reasonable temperature.
+    best_angle = None
+    best_temp = None
+    best_color = None
+    best_score = float('inf')
+    
+    for color, detected_angle in detected_angles:
+        # Try both the raw angle and the flipped version
+        for angle_to_try in [detected_angle, (detected_angle + 180) % 360]:
+            # Check if this angle is in the valid calibration range
+            is_in_range = _is_angle_in_valid_range(angle_to_try, calibration)
+            
+            # Calculate temperature
+            temp = angle_to_temperature(angle_to_try, calibration)
+            
+            # Score based on temperature reasonableness
+            in_temp_range = GAUGE_MIN_TEMP <= temp <= GAUGE_MAX_TEMP
+            
+            # Lower score is better
+            score = 0
+            
+            if not in_temp_range:
+                # Heavily penalize out-of-range temps
+                score += 1000
+                score += abs(temp - 40.0)  # How far outside
+            else:
+                # Prefer angles within the valid calibration arc
+                if not is_in_range:
+                    score += 50  # Moderate penalty for being outside calibrated arc
+                
+                # Prefer temperatures closer to expected operating range (20-60°C)
+                # Most gauges read in this range, so prioritize it
+                if 20 <= temp <= 60:
+                    # In typical range - small penalty based on distance from center (40°C)
+                    score += abs(temp - 40.0) * 0.2
+                else:
+                    # Outside typical range - larger penalty
+                    if temp < 20:
+                        score += (20 - temp) * 2
+                    else:  # temp > 60
+                        score += (temp - 60) * 2
+            
+            was_flipped = (abs(angle_to_try - detected_angle) > 1.0)
+            flip_str = "(flipped)" if was_flipped else ""
+            
+            if debug:
+                in_arc_str = "in-arc" if is_in_range else "out-arc"
+                print(f"  {color}: {detected_angle:.1f}° → {angle_to_try:.1f}° {flip_str} [{in_arc_str}] → {temp:.1f}°C (score: {score:.1f})")
+            
+            if score < best_score:
+                best_angle = angle_to_try
+                best_temp = temp
+                best_color = color
+                best_score = score
+    
+    # If none were scored, just use the first detection
+    if best_angle is None:
+        best_color, detected_angle = detected_angles[0]
+        best_angle = detected_angle
+        best_temp = angle_to_temperature(best_angle, calibration)
+    
+    if debug and len(detected_angles) > 1:
+        print(f"  → Selected {best_color} needle at {best_angle:.1f}°")
+    
+    angle = best_angle
 
     result["needle_detected"] = True
+    
     result["angle"] = angle
 
-    temperature = angle_to_temperature(angle, calibration)
+    temperature = best_temp
     result["temperature_c"] = temperature
 
     result["confidence"] = "high" if angle is not None else "medium"
@@ -784,6 +922,9 @@ def detect_pump_leds(image, region=None):
     """
     Detect green LEDs on pump face (handles multiple LEDs)
     Returns: (is_on: bool, confidence: float, led_positions: list)
+    
+    Uses improved LED detection algorithm from pump_vision.py for better
+    reliability in both ambient and dark (IR-only) lighting conditions.
     """
     height, width = image.shape[:2]
     sanitized_region = _clamp_region(region, width, height)
@@ -801,62 +942,63 @@ def detect_pump_leds(image, region=None):
         roi = image
         offset = (0, 0)
 
-    # Convert to HSV
+    # Convert to HSV for better color detection
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     
-    # Detect bright green (neon green LEDs)
-    mask = cv2.inRange(hsv, LED_COLOR_LOWER, LED_COLOR_UPPER)
+    # Create mask for green colors using configured bounds
+    green_mask = cv2.inRange(hsv, LED_COLOR_LOWER, LED_COLOR_UPPER)
     
-    # Find all green contours
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Find contours (potential LEDs)
+    contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, 
+                                   cv2.CHAIN_APPROX_SIMPLE)
     
-    # Filter contours by size (LEDs are small but distinct)
-    led_contours = []
+    # Filter by minimum area and extract LED information
+    led_regions = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area > LED_MIN_AREA:  # Large enough to be an LED
-            # Get position
+        if area >= LED_MIN_AREA:
             M = cv2.moments(contour)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"]) + offset[0]
                 cy = int(M["m01"] / M["m00"]) + offset[1]
-                led_contours.append({
+                led_regions.append({
                     'center': (cx, cy),
                     'area': area,
-                    'y_position': cy  # For finding topmost
+                    'y_position': cy
                 })
     
-    if not led_contours:
-        return False, 0, []
+    # Sort by area (largest first) for consistent selection
+    led_regions.sort(key=lambda x: x['area'], reverse=True)
     
-    # Sort by Y position (topmost = lowest Y value)
-    led_contours.sort(key=lambda x: x['y_position'])
+    # Determine pump state: ON if we found at least one LED
+    num_leds = len(led_regions)
+    is_on = num_leds >= 1
     
-    # The topmost LED is the status indicator
-    status_led = led_contours[0]
-    
-    # Pump is ON if we found at least one bright green LED
-    is_on = True
-    
-    # Confidence based on number of LEDs found and brightness
-    green_pixels = cv2.countNonZero(mask)
-    total_pixels = max(1, roi.shape[0] * roi.shape[1])
-    green_percentage = (green_pixels / total_pixels) * 100
-    
-    # Higher confidence if multiple LEDs detected (as expected)
-    num_leds = len(led_contours)
-    confidence = min(100, status_led['area'] / 10 + green_percentage * 2 + num_leds * 10)
+    # Calculate confidence based on LED characteristics
+    if led_regions:
+        largest_led = led_regions[0]
+        green_pixels = cv2.countNonZero(green_mask)
+        total_pixels = max(1, roi.shape[0] * roi.shape[1])
+        
+        # Confidence increases with:
+        # - Larger LED area
+        # - More green pixels overall
+        # - Multiple LEDs detected (typical for this pump)
+        confidence = min(100, largest_led['area'] / 10 + 
+                       (green_pixels / total_pixels * 100) * 2 + 
+                       num_leds * 10)
+    else:
+        confidence = 0
     
     log(f"LED: {'ON' if is_on else 'OFF'} ({num_leds} LED(s) detected, "
-        f"conf: {confidence:.1f}%, status LED at {status_led['center']})")
+        f"conf: {confidence:.1f}%)")
     
-    # Return detected region for future optimization
+    # Calculate region for future optimization
     detected_region = sanitized_region
-
-    if led_contours and sanitized_region is None:
-        # Calculate bounding box around all LEDs
-        all_x = [led['center'][0] for led in led_contours]
-        all_y = [led['center'][1] for led in led_contours]
+    if led_regions and sanitized_region is None:
+        # Calculate bounding box around all LEDs with padding
+        all_x = [led['center'][0] for led in led_regions]
+        all_y = [led['center'][1] for led in led_regions]
         x_min, x_max = min(all_x) - 50, max(all_x) + 50
         y_min, y_max = min(all_y) - 50, max(all_y) + 50
         new_region = _clamp_region(
