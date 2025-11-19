@@ -49,12 +49,26 @@ TEST_IMAGE_DIR = PROJECT_ROOT / "test_images"
 # Fixed tolerance for all tests - if images don't pass with 2°C, the system needs improvement
 TOLERANCE_C = 2.0
 
-DEFAULT_CALIBRATION = {
-    "zero_angle": 0.0,
-    "max_angle": 180.0,
-    "min_temp": 0.0,
-    "max_temp": 80.0,
-}
+
+def _load_calibration() -> dict[str, float]:
+    """Load calibration from gauge_calibration.json, with fallback to defaults."""
+    from pump_monitor import load_calibration
+    
+    calibration = load_calibration()
+    if calibration:
+        return calibration
+    
+    # Fallback to defaults if no calibration file exists
+    return {
+        "zero_angle": 0.0,
+        "max_angle": 180.0,
+        "min_temp": 0.0,
+        "max_temp": 80.0,
+    }
+
+
+# Load actual calibration once at module level
+CALIBRATION = _load_calibration()
 
 
 @dataclass(frozen=True)
@@ -76,8 +90,8 @@ class CvTestCase:
         return 20.0 if self.pump_on else 0.0
     
     def calibration_dict(self) -> dict[str, float]:
-        """Use default calibration for all tests."""
-        return DEFAULT_CALIBRATION.copy()
+        """Use actual calibration from gauge_calibration.json."""
+        return CALIBRATION.copy()
 
 
 def _parse_test_image_filename(filename: str) -> Optional[CvTestCase]:
@@ -191,12 +205,9 @@ def test_detect_gauge_components(cv_case) -> None:
     assert radius > 30, "Gauge radius unexpectedly small"
 
     cropped, new_center = crop_to_gauge(frame, (cx, cy), radius)
-    # Try to detect needle with any color
-    angle = None
-    for color in ["black", "red", "white"]:
-        angle = detect_needle(cropped, new_center, radius, needle_color=color)
-        if angle is not None:
-            break
+    
+    # Detect needle (uses multi-strategy edge detection)
+    angle = detect_needle(cropped, new_center, radius)
     
     assert angle is not None, f"Needle angle should be detected for {case.name}"
 
