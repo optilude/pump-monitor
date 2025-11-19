@@ -21,30 +21,12 @@ ssh pi@pumpmonitor.local
 sudo apt update && sudo apt upgrade -y
 ```
 
-### 1.2 Enable Camera
-
-```bash
-sudo raspi-config
-```
-
-Navigate:
-- **Interface Options** → **Camera** → **Enable**
-- Select **Finish**
-- **Reboot now** → Yes
-
-Wait 30 seconds, then reconnect:
-```bash
-ssh pi@pumpmonitor.local
-```
-
-### 1.3 Install Required Packages
+### 1.2 Install Required Packages
 
 ```bash
 # Install system packages
-sudo apt install -y python3-pip python3-picamera2 python3-opencv git
+sudo apt install -y python3-pip python3-picamera2 python3-opencv git python3-numpy python3-opencv python3-paho-mqtt
 
-# Install Python libraries
-pip3 install paho-mqtt opencv-python numpy --break-system-packages
 ```
 
 ## Part 2: Hardware Testing
@@ -53,7 +35,7 @@ pip3 install paho-mqtt opencv-python numpy --break-system-packages
 
 ```bash
 # Test camera detection
-libcamera-hello --list-cameras
+picamera-hello --list-cameras
 ```
 
 **Expected output:**
@@ -65,7 +47,7 @@ Available cameras
 
 **Capture test image:**
 ```bash
-libcamera-jpeg -o ~/test_camera.jpg --width 1920 --height 1080
+picamera-jpeg -o ~/test_camera.jpg --width 1920 --height 1080
 ```
 
 **Download to your Mac to verify:**
@@ -220,21 +202,7 @@ chmod +x ~/pump-monitor/pump_monitor.py
 
 ### 3.3 Configure MQTT Settings
 
-Edit configuration:
-```bash
-nano ~/pump-monitor/pump_monitor.py
-```
-
-Find and update these lines (near top of file):
-```python
-# MQTT Configuration
-MQTT_BROKER = "192.168.1.100"  # YOUR NAS IP ADDRESS
-MQTT_PORT = 1883
-MQTT_USER = None  # Your MQTT username or None
-MQTT_PASS = None  # Your MQTT password or None
-```
-
-Save: `Ctrl+X`, `Y`, `Enter`
+Copy over and edit `settings.json` and `gauge_calibration.json` as required.
 
 ## Part 4: Mount and Position Camera
 
@@ -242,7 +210,7 @@ Save: `Ctrl+X`, `Y`, `Enter`
 
 1. **Mount Pi + Camera** near pump using case with mounting holes
 2. **Position camera** to see BOTH:
-   - The 3 green LEDs on pump face
+   - The green LEDs on pump face
    - The temperature gauge (needle and numbers visible)
 3. **Distance:** 0.5-2 meters optimal
 4. **Angle:** Straight-on view of gauge face (minimize glare)
@@ -284,7 +252,7 @@ scp pi@pumpmonitor.local:~/pump-monitor/positioning_test.jpg ~/Desktop/
 ```
 
 **Verify:**
-- ✅ Can clearly see 3 green LEDs on pump
+- ✅ Can clearly see green LEDs on pump
 - ✅ Can clearly see temperature gauge
 - ✅ Gauge needle is visible
 - ✅ Gauge numbers are readable
@@ -293,52 +261,6 @@ scp pi@pumpmonitor.local:~/pump-monitor/positioning_test.jpg ~/Desktop/
 **Adjust camera position if needed**, then take another test image.
 
 ## Part 5: Calibration
-
-### 5.1 Test Green LED Detection
-
-```bash
-cd ~/pump-monitor
-
-python3 -c "
-import cv2
-import numpy as np
-
-img = cv2.imread('positioning_test.jpg')
-hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-# Detect green
-lower = np.array([35, 100, 100])
-upper = np.array([85, 255, 255])
-mask = cv2.inRange(hsv, lower, upper)
-
-cv2.imwrite('green_detection.jpg', mask)
-green_pixels = cv2.countNonZero(mask)
-print(f'Green pixels detected: {green_pixels}')
-print('Saved green_detection.jpg - white areas show detected green')
-"
-```
-
-Download `green_detection.jpg`:
-```bash
-# On Mac
-scp pi@pumpmonitor.local:~/pump-monitor/green_detection.jpg ~/Desktop/
-```
-
-**Check:** The 3 green LEDs should appear as white spots on black background.
-
-**If LEDs not detected:**
-```bash
-nano ~/pump-monitor/pump_monitor.py
-```
-
-Adjust:
-```python
-LED_COLOR_LOWER = np.array([30, 80, 80])   # Wider range
-LED_COLOR_UPPER = np.array([90, 255, 255])
-LED_MIN_AREA = 20  # Lower if LEDs are very small
-```
-
-### 5.2 Test Gauge Detection
 
 ```bash
 python3 ~/pump-monitor/pump_monitor.py test-image positioning_test.jpg
@@ -359,19 +281,8 @@ Final Result:
 ```
 
 **If gauge not detected:**
-```bash
-nano ~/pump-monitor/pump_monitor.py
-```
 
-Adjust the values under `DEFAULT_SETTINGS["gauge"]`:
-```python
-"min_radius": 20,   # Lower if gauge is very small
-"max_radius": 300,  # Higher if gauge is large
-```
-
-**If needle not detected:**
-
-Try adjusting needle color detection - check what color your needle is (black/red/white).
+Adjust the values in `settings.json` or perform calibration.
 
 ### 5.3 Calibrate Gauge for Accuracy
 
@@ -487,9 +398,316 @@ scp pi@pumpmonitor.local:~/pump-monitor/images/pump_*_temp.jpg ~/Desktop/
 - Ensure gauge is clearly visible without glare
 - Check needle detection is working (`Needle detected` in logs)
 
-## Part 7: Home Assistant Configuration
+## Part 7: Home Assistant Integration
 
-### 7.1 Ensure MQTT Integration
+### 7.1 Prerequisites
+
+Ensure MQTT broker is running:
+
+**Option A: Home Assistant Add-on (easiest)**
+1. Settings → Add-ons → Add-on Store
+2. Search "Mosquitto MQTT"
+3. Install → Start → Enable "Start on boot"
+4. Go to Configuration tab, add (if you want authentication):
+   ```yaml
+   logins:
+     - username: pumpmonitor
+       password: YOUR_PASSWORD
+   ```
+
+**Option B: Separate MQTT broker**
+- Already running on your NAS/server
+- Ensure port 1883 is accessible from Pi
+
+### 10.2 Test MQTT Connection
+
+From Pi, test publishing:
+```bash
+# Install MQTT client
+sudo apt install -y mosquitto-clients
+
+# Test publish (replace IP with your broker)
+mosquitto_pub -h 192.168.1.100 -t test/pump -m "hello"
+
+# If using authentication:
+mosquitto_pub -h 192.168.1.100 -u pumpmonitor -P YOUR_PASSWORD -t test/pump -m "hello"
+```
+
+Subscribe to verify (on another terminal):
+```bash
+mosquitto_sub -h 192.168.1.100 -t test/pump
+# Should see: hello
+```
+
+### 10.3 Configure Home Assistant Sensors
+
+Edit Home Assistant configuration:
+
+**Via File Editor add-on:**
+Settings → Add-ons → File Editor → Open Web UI → configuration.yaml
+
+**Or via SSH/SAMBA:**
+```bash
+nano /config/configuration.yaml
+```
+
+Add MQTT sensors:
+```yaml
+mqtt:
+  sensor:
+    # Pump on/off status
+    - name: "Pump Status"
+      state_topic: "home/pump/status"
+      icon: mdi:pump
+      
+    # Temperature reading
+    - name: "Pump Temperature"
+      state_topic: "home/pump/temperature"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      icon: mdi:thermometer
+      
+    # Last successful check time
+    - name: "Pump Last Check"
+      state_topic: "home/pump/last_check"
+      device_class: timestamp
+      icon: mdi:clock-check
+      
+    # LED detection confidence
+    - name: "Pump LED Confidence"
+      state_topic: "home/pump/led_confidence"
+      icon: mdi:check-circle
+      
+    # Temperature reading confidence
+    - name: "Pump Temperature Confidence"
+      state_topic: "home/pump/temp_confidence"
+      icon: mdi:thermometer-check
+      
+    # Diagnostic notes
+    - name: "Pump Notes"
+      state_topic: "home/pump/notes"
+      icon: mdi:note-text
+
+  # Optional: Binary sensor for cleaner pump status
+  binary_sensor:
+    - name: "Pump Running"
+      state_topic: "home/pump/status"
+      payload_on: "on"
+      payload_off: "off"
+      device_class: running
+      icon: mdi:pump
+```
+
+Save the file.
+
+### 10.4 Validate and Restart Home Assistant
+
+**Validate configuration:**
+1. Developer Tools → YAML → Check Configuration
+2. Wait for validation (should show green checkmark)
+
+**If errors appear:**
+- Check YAML indentation (use spaces, not tabs)
+- Ensure `mqtt:` section doesn't duplicate existing config
+- If you already have `mqtt:` section, merge the sensors into it
+
+**Restart Home Assistant:**
+1. Settings → System → Restart
+2. Click "Restart" and confirm
+3. Wait 1-2 minutes for restart
+
+### 10.5 Verify Sensors
+
+**Check sensor creation:**
+1. Settings → Devices & Services → MQTT
+2. Click on "Devices" or "Entities"
+3. Search for "pump"
+
+**Or use Developer Tools:**
+1. Developer Tools → States
+2. Filter by "pump"
+3. Should see all 6-7 sensors
+
+**Expected sensors:**
+- `sensor.pump_status` (on/off)
+- `sensor.pump_temperature` (e.g., 42.5)
+- `sensor.pump_last_check` (timestamp)
+- `sensor.pump_led_confidence` (e.g., 85.0%)
+- `sensor.pump_temperature_confidence` (high/medium/low)
+- `sensor.pump_notes` (diagnostic info)
+- `binary_sensor.pump_running` (true/false) - if configured
+
+### 10.6 Initial Testing
+
+**Start pump monitor on Pi:**
+```bash
+# If not running as service yet
+cd ~/pump-monitor
+python3 pump_monitor.py monitor
+
+# Or if already running as service
+sudo systemctl restart pump-monitor.service
+```
+
+**Watch for MQTT publish in logs:**
+```bash
+tail -f ~/pump-monitor/pump_monitor.log | grep -i mqtt
+```
+
+Should see:
+```
+Published to MQTT: pump=on/off, temp=XX.X°C
+```
+
+**Check Home Assistant:**
+- Go to Developer Tools → States
+- Find your pump sensors
+- Values should update within 5 minutes
+
+### 10.7 Create Dashboard
+
+**Add dashboard card** for pump monitoring:
+
+1. Go to your dashboard
+2. Click Edit (top right)
+3. Click "+ Add Card"
+4. Select "Manual" or "Show Code Editor"
+5. Paste:
+
+```yaml
+type: vertical-stack
+cards:
+  # Status indicator
+  - type: entity
+    entity: sensor.pump_status
+    name: Pump Status
+    icon: mdi:pump
+    
+  # Temperature gauge
+  - type: gauge
+    entity: sensor.pump_temperature
+    min: 0
+    max: 80
+    name: Pump Temperature
+    needle: true
+    severity:
+      green: 0
+      yellow: 50
+      orange: 60
+      red: 70
+      
+  # Details
+  - type: entities
+    title: Pump Details
+    entities:
+      - entity: sensor.pump_last_check
+        name: Last Check
+      - entity: sensor.pump_led_confidence
+        name: LED Confidence
+      - entity: sensor.pump_temperature_confidence
+        name: Temperature Confidence
+      - entity: sensor.pump_notes
+        name: Diagnostic Notes
+```
+
+6. Save dashboard
+
+**Alternative: Compact card:**
+```yaml
+type: glance
+entities:
+  - entity: sensor.pump_status
+    name: Status
+  - entity: sensor.pump_temperature
+    name: Temperature
+  - entity: sensor.pump_last_check
+    name: Last Check
+title: Pump Monitor
+```
+
+### 10.8 Create Automations (Optional)
+
+**Alert when pump temperature is high:**
+
+```yaml
+automation:
+  - alias: "Alert: Pump High Temperature"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.pump_temperature
+        above: 70
+    action:
+      - service: notify.notify
+        data:
+          title: "Pump Alert"
+          message: "Pump temperature is {{ states('sensor.pump_temperature') }}°C"
+```
+
+**Alert when pump has been running long:**
+
+```yaml
+automation:
+  - alias: "Alert: Pump Running Long Time"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.pump_running
+        to: "on"
+        for:
+          hours: 6
+    action:
+      - service: notify.notify
+        data:
+          title: "Pump Alert"
+          message: "Pump has been running for 6+ hours"
+```
+
+**Alert when monitoring system is offline:**
+
+```yaml
+automation:
+  - alias: "Alert: Pump Monitor Offline"
+    trigger:
+      - platform: state
+        entity_id: sensor.pump_last_check
+        to: "unavailable"
+        for:
+          minutes: 15
+    action:
+      - service: notify.notify
+        data:
+          title: "Pump Monitor Alert"
+          message: "Pump monitoring system is offline"
+```
+
+Add these to `configuration.yaml` or `automations.yaml`.
+
+### 10.9 Troubleshooting MQTT
+
+**Sensors not appearing:**
+```bash
+# On Pi, check MQTT broker is reachable
+ping 192.168.1.100
+
+# Test MQTT connection
+mosquitto_pub -h 192.168.1.100 -t home/pump/status -m "test"
+
+# Check HA logs
+# In HA: Settings → System → Logs → Filter "mqtt"
+```
+
+**Sensors show "unavailable":**
+- Check pump monitor service is running on Pi
+- Verify MQTT broker IP in settings.json
+- Check firewall not blocking port 1883
+- Ensure network connectivity between Pi and HA
+
+**Sensors not updating:**
+- Wait 5-10 minutes (normal check interval)
+- Check pump monitor logs for errors
+- Verify "Published to MQTT" appears in logs
+
+### 7.10 Verify Integration Complete
 
 In Home Assistant:
 1. Go to **Settings** → **Devices & Services**
@@ -600,9 +818,70 @@ With `pump_monitor.py` running on Pi, check Home Assistant dashboard.
 
 Sensors should update every 5 minutes.
 
-## Part 8: Run as Automatic Service
+## Part 8: Production Deployment
 
-### 8.1 Create Systemd Service
+### 8.1 Configure Settings File
+
+The system uses `settings.json` for configuration (separate from code):
+
+```bash
+cd ~/pump-monitor
+nano settings.json
+```
+
+Create configuration:
+```json
+{
+  "mqtt": {
+    "broker": "192.168.1.100",
+    "port": 1883,
+    "username": null,
+    "password": null,
+    "topic_prefix": "home/pump"
+  },
+  "led_detection": {
+    "color_lower": [35, 100, 100],
+    "color_upper": [85, 255, 255],
+    "min_area": 50
+  },
+  "gpio": {
+    "ir_led_pins": [26, 27]
+  },
+  "timing": {
+    "led_check_interval_seconds": 300,
+    "temp_check_interval_pump_on": 300,
+    "temp_check_interval_pump_off": 1800,
+    "image_retention_hours": 4
+  },
+  "storage": {
+    "image_dir": "images",
+    "log_file": "pump_monitor.log",
+    "state_file": "state.json"
+  },
+  "gauge": {
+    "min_temp": 0,
+    "max_temp": 80,
+    "calibration_file": "gauge_calibration.json"
+  }
+}
+```
+
+**Key settings explained:**
+
+- **led_check_interval_seconds**: How often to check pump status (300s = 5 min)
+- **temp_check_interval_pump_on**: Temperature check frequency when pump is ON (5 min)
+- **temp_check_interval_pump_off**: Temperature check frequency when pump is OFF (30 min)
+- **image_retention_hours**: Auto-delete images older than this (4 hours default)
+
+**Scheduling behavior:**
+- Pump status (LED) checked every 5 minutes
+- Temperature checked intelligently:
+  - Every 5 minutes when pump is ON (frequent monitoring during operation)
+  - Every 30 minutes when pump is OFF (reduced checks when idle)
+  - First check always includes temperature reading
+- This adaptive scheduling saves processing and storage
+
+### 8.2 Create Systemd Service
 
 ```bash
 sudo nano /etc/systemd/system/pump-monitor.service
@@ -628,9 +907,53 @@ StandardError=append:/home/pi/pump-monitor/service.log
 WantedBy=multi-user.target
 ```
 
+### 8.2 Create Systemd Service
+
+**Why systemd?** This ensures:
+- ✅ Service starts automatically on boot
+- ✅ Automatic restart if crashes
+- ✅ Logging integrated with system
+- ✅ Standard start/stop/status commands
+
+```bash
+sudo nano /etc/systemd/system/pump-monitor.service
+```
+
+Paste:
+```ini
+[Unit]
+Description=Pump Monitor Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/pump-monitor
+ExecStart=/usr/bin/python3 /home/pi/pump-monitor/pump_monitor.py monitor --config /home/pi/pump-monitor/settings.json
+Restart=always
+RestartSec=30
+StandardOutput=append:/home/pi/pump-monitor/service.log
+StandardError=append:/home/pi/pump-monitor/service.log
+
+# Resource limits to prevent runaway usage
+MemoryMax=512M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Configuration notes:**
+- `After=network-online.target`: Waits for network before starting
+- `Restart=always`: Auto-restart on any failure
+- `RestartSec=30`: Wait 30 seconds before restart (prevents rapid restart loops)
+- `MemoryMax=512M`: Limit memory to prevent SD card issues
+- `CPUQuota=50%`: Limit CPU to prevent overheating on Pi Zero
+
 Save: `Ctrl+X`, `Y`, `Enter`
 
-### 8.2 Enable and Start Service
+### 8.3 Enable and Start Service
 
 ```bash
 # Reload systemd
@@ -648,7 +971,21 @@ sudo systemctl status pump-monitor.service
 
 Should show: `Active: active (running)` in green.
 
-### 8.3 Monitor Service
+**Verify automatic startup:**
+```bash
+# Reboot Pi to test
+sudo reboot
+
+# Wait 1 minute, reconnect
+ssh pi@pumpmonitor.local
+
+# Check service started automatically
+sudo systemctl status pump-monitor.service
+
+# Should show "Active: active (running)" and recent log entries
+```
+
+### 8.4 Monitor Service
 
 ```bash
 # View live logs
@@ -661,25 +998,345 @@ sudo journalctl -u pump-monitor.service -n 50
 tail -f ~/pump-monitor/pump_monitor.log
 ```
 
-### 8.4 Service Management Commands
+### 8.5 Service Management Commands
 
 ```bash
 # Stop service
 sudo systemctl stop pump-monitor.service
 
-# Restart service
+# Start service
+sudo systemctl start pump-monitor.service
+
+# Restart service (after config changes)
 sudo systemctl restart pump-monitor.service
 
-# Disable auto-start
+# Disable auto-start on boot
 sudo systemctl disable pump-monitor.service
+
+# Re-enable auto-start
+sudo systemctl enable pump-monitor.service
 
 # Check status
 sudo systemctl status pump-monitor.service
+
+# View service configuration
+systemctl cat pump-monitor.service
 ```
 
-## Part 9: Monitoring and Maintenance
+## Part 9: Disk Space Management
 
-### 9.1 Check System Status
+### 9.1 Understanding Storage Usage
+
+The system manages storage automatically with built-in cleanup:
+
+**Automatic image cleanup:**
+- Images older than 4 hours are automatically deleted
+- Runs during each monitoring cycle
+- Configurable via `image_retention_hours` in settings.json
+
+**Typical storage usage:**
+```
+~/pump-monitor/
+├── images/           ~50-100MB  (auto-cleaned, rolling 4-hour window)
+├── pump_monitor.log  ~5-10MB    (needs manual rotation)
+├── service.log       ~5-10MB    (needs manual rotation)
+├── state.json        <1KB       (current state only)
+└── *.py, *.json      ~100KB     (program files)
+Total: ~100-150MB with automatic cleanup
+```
+
+**Image retention calculation:**
+- Image size: ~2MB each
+- Pump ON: 1 image every 5 min = 12/hour = 48 images in 4 hours = ~96MB
+- Pump OFF: 1 image every 30 min = 2/hour = 8 images in 4 hours = ~16MB
+- Average: ~50-75MB maintained automatically
+
+### 9.2 Configure Image Retention
+
+Adjust retention period in settings.json:
+
+```bash
+nano ~/pump-monitor/settings.json
+```
+
+Modify:
+```json
+{
+  "timing": {
+    "image_retention_hours": 4
+  }
+}
+```
+
+**Recommendations:**
+- **4 hours** (default): Good for troubleshooting recent issues
+- **2 hours**: Minimal storage (~25-50MB)
+- **8 hours**: Extended history (~100-200MB)
+- **24 hours**: Full day (~300-600MB) - only if you have space
+
+After changing, restart service:
+```bash
+sudo systemctl restart pump-monitor.service
+```
+
+### 9.3 Log File Rotation
+
+Set up automatic log rotation to prevent logs growing indefinitely:
+
+```bash
+sudo nano /etc/logrotate.d/pump-monitor
+```
+
+Paste:
+```
+/home/pi/pump-monitor/pump_monitor.log
+/home/pi/pump-monitor/service.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 pi pi
+    sharedscripts
+    postrotate
+        systemctl reload pump-monitor.service >/dev/null 2>&1 || true
+    endscript
+}
+```
+
+**This configuration:**
+- Rotates logs daily
+- Keeps 7 days of logs (compressed)
+- Automatically creates new log files
+- Logs older than 7 days are deleted
+- Each log ~1-2MB/day, compressed to ~100-200KB
+
+Test log rotation:
+```bash
+sudo logrotate -f /etc/logrotate.d/pump-monitor
+ls -lh ~/pump-monitor/*.log*
+```
+
+### 9.4 Monitor Disk Space
+
+**Check current usage:**
+```bash
+# Overall disk usage
+df -h /
+
+# Pump monitor directory
+du -sh ~/pump-monitor/
+du -sh ~/pump-monitor/images/
+
+# Detailed breakdown
+du -h ~/pump-monitor/ | sort -h
+```
+
+**Expected output:**
+```
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/mmcblk0p2   30G  5.2G   23G  19% /
+
+100M    /home/pi/pump-monitor/images
+5.0M    /home/pi/pump-monitor/pump_monitor.log
+150M    /home/pi/pump-monitor/
+```
+
+**Set up disk space monitoring** (optional, sends alerts):
+
+```bash
+nano ~/check_disk_space.sh
+```
+
+Paste:
+```bash
+#!/bin/bash
+THRESHOLD=80
+CURRENT=$(df / | grep / | awk '{ print $5}' | sed 's/%//g')
+
+if [ "$CURRENT" -gt "$THRESHOLD" ]; then
+    logger -t pump-monitor "WARNING: Disk usage at ${CURRENT}%"
+    echo "$(date): Disk usage critical: ${CURRENT}%" >> ~/pump-monitor/disk_alerts.log
+fi
+```
+
+Make executable and schedule:
+```bash
+chmod +x ~/check_disk_space.sh
+
+# Add to crontab (run every hour)
+crontab -e
+```
+
+Add line:
+```
+0 * * * * /home/pi/check_disk_space.sh
+```
+
+### 9.5 Manual Cleanup (if needed)
+
+**Clean old images immediately:**
+```bash
+# Delete images older than 2 hours
+find ~/pump-monitor/images/ -name "pump_*.jpg" -mmin +120 -delete
+
+# Delete ALL images (be careful!)
+rm ~/pump-monitor/images/pump_*.jpg
+```
+
+**Clean logs:**
+```bash
+# Truncate log files (keeps last 1000 lines)
+tail -1000 ~/pump-monitor/pump_monitor.log > ~/pump-monitor/pump_monitor.log.tmp
+mv ~/pump-monitor/pump_monitor.log.tmp ~/pump-monitor/pump_monitor.log
+
+tail -1000 ~/pump-monitor/service.log > ~/pump-monitor/service.log.tmp
+mv ~/pump-monitor/service.log.tmp ~/pump-monitor/service.log
+```
+
+**Emergency cleanup if disk is full:**
+```bash
+# Stop service to prevent new writes
+sudo systemctl stop pump-monitor.service
+
+# Clean everything non-essential
+rm ~/pump-monitor/images/*.jpg
+rm ~/pump-monitor/*.log
+rm ~/pump-monitor/service.log
+
+# Restart
+sudo systemctl start pump-monitor.service
+```
+
+### 9.6 SD Card Health
+
+**Check SD card health:**
+```bash
+# Check for filesystem errors
+sudo fsck -f /dev/mmcblk0p2
+
+# View I/O statistics
+iostat -x 1 5
+```
+
+**Prevent SD card wear:**
+- Use Class 10 or UHS-1 SD card (minimum)
+- Consider reducing image retention to 2 hours
+- Use log rotation (already configured above)
+- Avoid full filesystem (keep <80% used)
+
+## Part 10: Testing and Validation
+
+### 10.1 Initial System Test (Before Production)
+
+**Test 1: Hardware functionality**
+```bash
+# Test IR LEDs
+python3 ~/test_leds.py
+# View through phone camera - should see purple/white glow
+
+# Test camera capture
+python3 ~/test_camera_ir.py
+scp pi@pumpmonitor.local:~/test_with_ir.jpg ~/Desktop/
+# Verify image quality
+```
+
+**Test 2: Computer vision detection**
+```bash
+cd ~/pump-monitor
+
+# Capture current state
+python3 ~/test_camera_ir.py
+mv test_with_ir.jpg test_current.jpg
+
+# Test gauge reading
+python3 pump_monitor.py test-image test_current.jpg
+```
+
+Expected output:
+```
+Gauge detected: center=(320, 240), radius=95
+Needle detected: angle=245.3°
+Final Result:
+  Temperature: 42.5°C
+  Confidence: high
+```
+
+Verify:
+- Gauge detected ✓
+- Needle detected ✓
+- Temperature reading reasonable ✓
+- Confidence is "high" or "medium" ✓
+
+**Test 3: MQTT publishing**
+```bash
+# Subscribe to all pump topics (in another terminal)
+mosquitto_sub -h 192.168.1.100 -t "home/pump/#" -v
+
+# Run single cycle
+python3 pump_monitor.py monitor
+# (will run one cycle then wait - Ctrl+C to stop)
+```
+
+Should see MQTT messages published to all topics.
+
+**Test 4: Service auto-start**
+```bash
+# Enable and start service
+sudo systemctl enable pump-monitor.service
+sudo systemctl start pump-monitor.service
+
+# Reboot to test auto-start
+sudo reboot
+
+# After reboot, verify started automatically
+ssh pi@pumpmonitor.local
+sudo systemctl status pump-monitor.service
+```
+
+## Part 11: Extended Testing
+
+### 11.1 24-Hour Acceptance Test
+
+Run this test before relying on the system in production:
+
+**Start test:**
+```bash
+sudo systemctl restart pump-monitor.service
+date  # Note start time
+```
+
+**After 24 hours, check:**
+```bash
+# Verify still running
+sudo systemctl status pump-monitor.service
+
+# Check cycle count (~288 expected for 5-min intervals)
+grep "Starting cycle" ~/pump-monitor/pump_monitor.log | wc -l
+
+# Check for errors
+grep -i "error\|failed\|crash" ~/pump-monitor/pump_monitor.log
+
+# Verify disk space stable
+du -sh ~/pump-monitor/images/
+# Should be < 200MB
+
+# Check image cleanup working
+find ~/pump-monitor/images/ -name "*.jpg" -mmin +240 | wc -l
+# Should be 0 (no images older than 4 hours)
+```
+
+**Acceptance criteria:**
+- ✓ Service ran 24 hours without crashing
+- ✓ ~288 cycles completed
+- ✓ No critical errors in logs
+- ✓ Disk space under control (<500MB total)
+- ✓ HA sensors updating regularly
+
+## Part 12: Ongoing Maintenance
+
+### 12.1 Check System Status
 
 ```bash
 # Service status
@@ -696,19 +1353,23 @@ df -h
 du -sh ~/pump-monitor/images/
 ```
 
-### 9.2 Adjust Check Intervals
+### 12.2 Adjust Check Intervals
 
-If you want to change how often things are checked:
+Edit settings.json to change monitoring frequency:
 
 ```bash
-nano ~/pump-monitor/pump_monitor.py
+nano ~/pump-monitor/settings.json
 ```
 
 Modify:
-```python
-LED_CHECK_INTERVAL_SECONDS = 300   # Check LED every 5 min
-TEMP_CHECK_INTERVAL_PUMP_ON = 300  # Check temp every 5 min when ON
-TEMP_CHECK_INTERVAL_PUMP_OFF = 1800 # Check temp every 30 min when OFF
+```json
+{
+  "timing": {
+    "led_check_interval_seconds": 300,
+    "temp_check_interval_pump_on": 300,
+    "temp_check_interval_pump_off": 1800
+  }
+}
 ```
 
 Then restart:
@@ -716,38 +1377,90 @@ Then restart:
 sudo systemctl restart pump-monitor.service
 ```
 
-### 9.3 Recalibrate Gauge
+### 12.3 Recalibrate Gauge
 
-If readings become inaccurate:
+If temperature readings become inaccurate over time:
 
 ```bash
-# Stop service
+# Stop service temporarily
 sudo systemctl stop pump-monitor.service
 
-# Capture new calibration images
 cd ~/pump-monitor
-python3 ~/test_camera_ir.py
-mv test_with_ir.jpg gauge_new1.jpg
-# (wait for different temperature)
-python3 ~/test_camera_ir.py
-mv test_with_ir.jpg gauge_new2.jpg
 
-# Recalibrate
-python3 pump_monitor.py calibrate gauge_new1.jpg 25 gauge_new2.jpg 55
+# Capture calibration images at two known temperatures
+# (read actual temperature from gauge, don't guess)
+python3 ~/test_camera_ir.py
+mv test_with_ir.jpg gauge_temp1.jpg
+
+# Wait for pump to reach different temperature
+# Then capture second image
+python3 ~/test_camera_ir.py
+mv test_with_ir.jpg gauge_temp2.jpg
+
+# Run calibration (replace TEMP1, TEMP2 with actual temps)
+python3 pump_monitor.py calibrate gauge_temp1.jpg TEMP1 gauge_temp2.jpg TEMP2
+
+# Verify calibration created
+cat gauge_calibration.json
 
 # Restart service
 sudo systemctl start pump-monitor.service
 ```
 
-### 9.4 Backup Configuration
+### 12.4 Weekly Maintenance Tasks
 
+**Every week, check:**
 ```bash
-# On your Mac
-scp pi@pumpmonitor.local:~/pump-monitor/*.py ~/backup/
-scp pi@pumpmonitor.local:~/pump-monitor/*.json ~/backup/
+# Service health
+sudo systemctl status pump-monitor.service
+
+# Disk usage
+df -h /
+du -sh ~/pump-monitor/
+
+# Recent errors
+grep -i error ~/pump-monitor/pump_monitor.log | tail -20
+
+# Detection quality
+tail -50 ~/pump-monitor/pump_monitor.log | grep "confidence:"
 ```
 
-## Part 10: Troubleshooting
+### 12.5 Monthly Maintenance Tasks
+
+**Every month:**
+
+1. **Verify calibration accuracy**
+   - Compare detected temperature to gauge reading
+   - Recalibrate if off by more than ±3°C
+
+2. **Check camera lens**
+   ```bash
+   # Capture test image
+   python3 ~/test_camera_ir.py
+   scp pi@pumpmonitor.local:~/test_with_ir.jpg ~/Desktop/
+   ```
+   - Clean lens if dusty
+   - Check for condensation
+
+3. **Review disk usage trends**
+   ```bash
+   du -h ~/pump-monitor/ | sort -h
+   ```
+
+4. **Backup configuration**
+   ```bash
+   # On your Mac
+   scp pi@pumpmonitor.local:~/pump-monitor/*.json ~/backup/pump-monitor/
+   scp pi@pumpmonitor.local:~/pump-monitor/*.py ~/backup/pump-monitor/
+   ```
+
+5. **Check SD card health**
+   ```bash
+   # On Pi
+   sudo fsck -f /dev/mmcblk0p2
+   ```
+
+## Part 13: Troubleshooting
 
 ### Camera Issues
 
@@ -820,63 +1533,206 @@ Common causes:
 
 ### Performance
 - **LED detection:** ~0.1-0.2 seconds
-- **Gauge detection:** ~0.5-1.0 seconds
-- **Processing per cycle:** ~1-2 seconds
-- **CPU usage:** <5% average
-- **RAM usage:** ~150-200MB
+- **Gauge detection:** ~0.5-1.0 seconds  
+- **Full cycle time:** ~1-3 seconds
+- **CPU usage:** <5% average (Pi Zero 2 W)
+- **Memory usage:** ~150-200MB
+- **Check frequency:** Every 5 minutes (LED), adaptive for temperature
 
 ### Storage
 - **Images:** ~2MB each
-- **Retention:** 4 hours (auto-cleanup)
-- **Total storage:** ~100-200MB
+- **Retention:** 4 hours default (configurable)
+- **With 4-hour retention:** ~50-100MB for images
+- **Logs:** ~5-10MB with rotation
+- **Total ongoing usage:** ~100-150MB
+
+### Network
+- **MQTT traffic:** <1KB per update
+- **Update frequency:** Every 5-30 minutes
+- **Monthly bandwidth:** ~1-2MB (negligible)
 
 ### Cost
-- **Hardware:** £60-80 (one-time)
-- **Electricity:** ~1W = negligible
-- **API/Cloud:** £0/month
-- **Total monthly cost: £0** ✅
+- **Hardware:** £60-80 (one-time purchase)
+- **Power:** ~1W = £0.02/month
+- **API/Cloud costs:** £0/month (100% local processing)
+- **Total monthly cost:** £0.02 ✅
+
+### Reliability
+- **Auto-restart:** Service restarts automatically on failure
+- **Auto-start:** Starts automatically on boot
+- **Image cleanup:** Automatic, prevents disk filling
+- **Log rotation:** Prevents log files growing unbounded
+- **Expected uptime:** 99%+ with proper setup
 
 ## Quick Reference
 
-### Start/Stop Commands
+### Common Commands
+
+**Service management:**
 ```bash
-sudo systemctl start pump-monitor.service   # Start
-sudo systemctl stop pump-monitor.service    # Stop
-sudo systemctl restart pump-monitor.service # Restart
-sudo systemctl status pump-monitor.service  # Status
+sudo systemctl start pump-monitor.service      # Start
+sudo systemctl stop pump-monitor.service       # Stop
+sudo systemctl restart pump-monitor.service    # Restart
+sudo systemctl status pump-monitor.service     # Status
+sudo systemctl enable pump-monitor.service     # Enable auto-start
+sudo systemctl disable pump-monitor.service    # Disable auto-start
 ```
 
-### View Logs
+**View logs:**
 ```bash
-tail -f ~/pump-monitor/pump_monitor.log           # Application log
-sudo journalctl -u pump-monitor.service -f        # Service log
+tail -f ~/pump-monitor/pump_monitor.log                # Live application log
+sudo journalctl -u pump-monitor.service -f             # Live service log
+tail -50 ~/pump-monitor/pump_monitor.log               # Recent entries
+grep -i error ~/pump-monitor/pump_monitor.log          # Errors only
 ```
 
-### Test Components
+**Test components:**
 ```bash
-python3 ~/test_leds.py                            # Test IR LEDs
-python3 ~/test_camera_ir.py                       # Test camera
-python3 ~/pump-monitor/pump_monitor.py test-image <img> # Test gauge reading
+python3 ~/test_leds.py                                 # Test IR LEDs
+python3 ~/test_camera_ir.py                            # Test camera
+python3 ~/pump-monitor/pump_monitor.py test-image FILE # Test gauge reading
+mosquitto_sub -h BROKER_IP -t "home/pump/#" -v         # Monitor MQTT
 ```
 
-## Success Criteria
+**Maintenance:**
+```bash
+df -h /                                                # Check disk space
+du -sh ~/pump-monitor/images/                          # Check image storage
+sudo systemctl status pump-monitor.service             # Check service health
+grep "confidence:" ~/pump-monitor/pump_monitor.log | tail -20  # Check detection quality
+```
 
-✅ Camera captures clear images of pump and gauge  
-✅ IR LEDs illuminate scene in darkness  
-✅ Green LEDs detected reliably (confidence >80%)  
-✅ Gauge needle detected and temperature read (confidence high/medium)  
-✅ Temperature readings within ±2-3°C of actual  
-✅ Data publishes to Home Assistant via MQTT  
+**Calibration:**
+```bash
+cd ~/pump-monitor
+python3 pump_monitor.py calibrate IMG1 TEMP1 IMG2 TEMP2  # Calibrate gauge
+cat gauge_calibration.json                               # View calibration
+```
+
+### Configuration Files
+
+- **settings.json** - Main configuration (MQTT, timing, detection parameters)
+- **gauge_calibration.json** - Gauge angle-to-temperature mapping
+- **state.json** - Current system state (auto-managed)
+- **pump_monitor.log** - Application log file
+- **service.log** - Systemd service log
+- **images/** - Captured images (auto-cleaned)
+
+### File Locations
+
+```
+/home/pi/pump-monitor/
+├── pump_monitor.py          # Main application
+├── settings.json            # Configuration
+├── gauge_calibration.json   # Calibration data
+├── state.json               # Current state
+├── pump_monitor.log         # Application log
+├── service.log              # Service log
+└── images/                  # Image storage (auto-managed)
+    └── pump_YYYYMMDD_HHMMSS_*.jpg
+
+/etc/systemd/system/
+└── pump-monitor.service     # Service configuration
+
+/etc/logrotate.d/
+└── pump-monitor             # Log rotation config
+```
+
+### Important Settings
+
+**In settings.json:**
+
+```json
+{
+  "timing": {
+    "led_check_interval_seconds": 300,        // How often to check LED (5 min)
+    "temp_check_interval_pump_on": 300,       // Temp check when ON (5 min)
+    "temp_check_interval_pump_off": 1800,     // Temp check when OFF (30 min)
+    "image_retention_hours": 4                // Auto-delete older images
+  },
+  "mqtt": {
+    "broker": "192.168.1.100",                // Your MQTT broker IP
+    "topic_prefix": "home/pump"               // MQTT topic prefix
+  }
+}
+```
+
+### Home Assistant MQTT Topics
+
+- `home/pump/status` - Pump state (on/off)
+- `home/pump/temperature` - Temperature in °C
+- `home/pump/last_check` - Last update timestamp
+- `home/pump/led_confidence` - LED detection confidence %
+- `home/pump/temp_confidence` - Temperature confidence (high/medium/low)
+- `home/pump/notes` - Diagnostic information
+
+## Success Checklist
+
+Before considering deployment complete, verify:
+
+**Hardware:**
+- [ ] Camera captures clear images
+- [ ] IR LEDs illuminate scene (visible via phone camera)
+- [ ] Pump and gauge both visible in images
+- [ ] No loose connections
+
+**Detection:**
+- [ ] Gauge circle detected reliably (>95% success rate)
+- [ ] Needle angle detected in test images
+- [ ] Green LEDs detected when pump is ON
+- [ ] Temperature readings within ±3°C of actual gauge reading
+- [ ] Confidence levels mostly "high" or "medium"
+
+**Communication:**
+- [ ] MQTT broker accessible from Pi
+- [ ] Messages publish successfully (check logs)
+- [ ] Home Assistant sensors created
+- [ ] Sensor values update in HA dashboard
+- [ ] Timestamps are current
+
+**Service & Reliability:**
+- [ ] Service starts on boot automatically
+- [ ] Service runs 24+ hours without crashing
+- [ ] No critical errors in logs
+- [ ] Service restarts automatically after reboot
+- [ ] Logs show regular monitoring cycles
+
+**Storage:**
+- [ ] Images save to images/ directory
+- [ ] Old images deleted automatically (check after 5+ hours)
+- [ ] Disk usage stable (<500MB total)
+- [ ] Log rotation configured
+- [ ] Filesystem <80% full
+
+**Testing:**
+- [ ] Passed 24-hour acceptance test
+- [ ] ~288 cycles completed in 24 hours
+- [ ] Detection accuracy validated
+- [ ] MQTT publishing 100% successful
+- [ ] Home Assistant integration working
+
+## Support & Next Steps
+
+### You've completed deployment when:
+
 ✅ Service runs automatically on boot  
-✅ System operates continuously without intervention
+✅ Monitoring cycles execute every 5 minutes  
+✅ Temperature and pump status detected accurately  
+✅ Data publishes to Home Assistant successfully  
+✅ Storage managed automatically (no manual intervention)  
+✅ System recovers automatically from failures  
 
-## Support
+### Ongoing responsibilities:
 
-If you encounter issues:
+- **Weekly:** Check service status and logs for errors
+- **Monthly:** Verify calibration accuracy, backup configuration
+- **As needed:** Recalibrate if readings drift, clean camera lens
 
-1. **Check logs** for error messages
-2. **Test components individually** (camera, LEDs, gauge detection)
-3. **Verify network connectivity** (MQTT broker accessible)
-4. **Review calibration** if readings are inaccurate
+### Future enhancements (optional):
 
-System is now complete and monitoring your pump!
+- Add notification automations in Home Assistant
+- Create historical graphs of pump temperature
+- Set up alerts for extended pump runtime
+- Add camera snapshot capability to HA dashboard
+
+**Your pump monitor is now production-ready and operating autonomously!**
