@@ -450,21 +450,20 @@ def read_gauge(image, calibration=None, debug=False):
                 score += 1000
                 score += abs(temp - 40.0)  # How far outside
             else:
-                # Prefer angles within the valid calibration arc
+                # STRONG preference for angles within the valid calibration arc
+                # This is the most reliable signal for choosing the correct angle
                 if not is_in_range:
-                    score += 50  # Moderate penalty for being outside calibrated arc
-                
-                # Prefer temperatures closer to expected operating range (20-60°C)
-                # Most gauges read in this range, so prioritize it
-                if 20 <= temp <= 60:
-                    # In typical range - small penalty based on distance from center (40°C)
-                    score += abs(temp - 40.0) * 0.2
+                    score += 100  # Large penalty for being outside calibrated arc
                 else:
-                    # Outside typical range - larger penalty
-                    if temp < 20:
-                        score += (20 - temp) * 2
-                    else:  # temp > 60
-                        score += (temp - 60) * 2
+                    # Reward being in the calibrated range
+                    score += 0.5
+                
+                # Secondary factor: prefer reasonable temperature ranges
+                # But don't let this override the calibration range check
+                if temp < 15:
+                    score += (15 - temp) * 0.5
+                elif temp > 65:
+                    score += (temp - 65) * 0.5
             
             was_flipped = (abs(angle_to_try - angle) > 1.0)
             flip_str = "(flipped)" if was_flipped else ""
