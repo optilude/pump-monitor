@@ -7,25 +7,24 @@ Smart scheduling: checks temp frequently when pump ON, less when OFF
 """
 
 import argparse
-from picamera2 import Picamera2
-import RPi.GPIO as GPIO
-import paho.mqtt.client as mqtt
-import cv2
-import numpy as np
 import json
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-import sys
 
-# Import gauge reader
-sys.path.append(str(Path(__file__).parent))
+import cv2
+import numpy as np
+import paho.mqtt.client as mqtt
+
 try:
-    from gauge_reader import read_gauge, load_calibration, apply_settings as apply_gauge_settings
-except ImportError:
-    print("ERROR: gauge_reader.py not found in same directory!")
-    print("Make sure gauge_reader.py is in ~/pump-monitor/")
-    sys.exit(1)
+    from picamera2 import Picamera2
+except ImportError:  # pragma: no cover - expected on non-Pi dev systems
+    Picamera2 = None
+
+try:
+    import RPi.GPIO as GPIO
+except ImportError:  # pragma: no cover - expected on non-Pi dev systems
+    GPIO = None
 
 # ============================================================================
 # CONFIGURATION
@@ -77,6 +76,365 @@ DEFAULT_SETTINGS = {
 CONFIG: dict = {}
 CONFIG_DIR = DEFAULT_CONFIG_PATH.parent
 CURRENT_CONFIG_PATH = None
+
+
+# ==========================================================================
+# GAUGE SETTINGS
+# ==========================================================================
+
+GAUGE_MIN_TEMP = DEFAULT_SETTINGS["gauge"]["min_temp"]
+GAUGE_MAX_TEMP = DEFAULT_SETTINGS["gauge"]["max_temp"]
+GAUGE_ARC_DEGREES = DEFAULT_SETTINGS["gauge"]["arc_degrees"]
+GAUGE_ZERO_ANGLE = DEFAULT_SETTINGS["gauge"]["zero_angle"]
+GAUGE_MIN_RADIUS = DEFAULT_SETTINGS["gauge"]["min_radius"]
+GAUGE_MAX_RADIUS = DEFAULT_SETTINGS["gauge"]["max_radius"]
+NEEDLE_COLOR_RANGE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+CALIBRATION_FILE = Path(DEFAULT_SETTINGS["gauge"]["calibration_file"]).resolve()
+
+
+def apply_gauge_settings(settings, base_dir):
+    """Merge gauge settings from config into module globals."""
+
+    global GAUGE_MIN_TEMP
+    global GAUGE_MAX_TEMP
+    global GAUGE_ARC_DEGREES
+    global GAUGE_ZERO_ANGLE
+    global GAUGE_MIN_RADIUS
+    global GAUGE_MAX_RADIUS
+    global NEEDLE_COLOR_RANGE
+    global CALIBRATION_FILE
+
+    defaults = DEFAULT_SETTINGS["gauge"].copy()
+    overrides = settings.get("gauge", {}) if settings else {}
+
+    gauge_settings = {**defaults, **overrides}
+
+    GAUGE_MIN_TEMP = gauge_settings["min_temp"]
+    GAUGE_MAX_TEMP = gauge_settings["max_temp"]
+    GAUGE_ARC_DEGREES = gauge_settings["arc_degrees"]
+    GAUGE_ZERO_ANGLE = gauge_settings["zero_angle"]
+    GAUGE_MIN_RADIUS = gauge_settings["min_radius"]
+    GAUGE_MAX_RADIUS = gauge_settings["max_radius"]
+
+    needle_colors: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for name, bounds in gauge_settings.get("needle_color_range", {}).items():
+        lower, upper = bounds
+        needle_colors[name] = (
+            np.array(lower, dtype=np.uint8),
+            np.array(upper, dtype=np.uint8),
+        )
+    NEEDLE_COLOR_RANGE = needle_colors
+
+    CALIBRATION_FILE = _resolve_path(gauge_settings["calibration_file"], base_dir)
+
+
+# ==========================================================================
+# GAUGE DETECTION UTILITIES
+# ==========================================================================
+
+
+def detect_gauge_circle(image):
+    """Detect the circular gauge and return (center_x, center_y, radius)."""
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1,
+        minDist=100,
+        param1=50,
+        param2=30,
+        minRadius=GAUGE_MIN_RADIUS,
+        maxRadius=GAUGE_MAX_RADIUS,
+    )
+
+    if circles is not None:
+        circles = np.round(circles[0, :]).astype("int")
+        x, y, r = circles[0]
+        return (x, y, r)
+
+    return None
+
+
+def crop_to_gauge(image, center, radius):
+    """Crop image to the gauge region and return (cropped_image, new_center)."""
+
+    x, y = center
+    padding = int(radius * 0.3)
+
+    x1 = max(0, x - radius - padding)
+    y1 = max(0, y - radius - padding)
+    x2 = min(image.shape[1], x + radius + padding)
+    y2 = min(image.shape[0], y + radius + padding)
+
+    cropped = image[y1:y2, x1:x2]
+    new_center = (x - x1, y - y1)
+
+    return cropped, new_center
+
+
+def detect_needle(image, center, radius, needle_color="black"):
+    """Detect the needle angle in degrees, or return None if not found."""
+
+    if needle_color not in NEEDLE_COLOR_RANGE:
+        return None
+
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    cv2.circle(mask, center, int(radius * 0.9), 255, -1)
+    cv2.circle(mask, center, int(radius * 0.2), 0, -1)
+
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    lower, upper = NEEDLE_COLOR_RANGE[needle_color]
+    color_mask = cv2.inRange(hsv, lower, upper)
+
+    needle_mask = cv2.bitwise_and(color_mask, mask)
+
+    if cv2.countNonZero(needle_mask) < 10:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        needle_mask = cv2.bitwise_and(edges, mask)
+
+    lines = cv2.HoughLinesP(
+        needle_mask,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=20,
+        minLineLength=int(radius * 0.3),
+        maxLineGap=10,
+    )
+
+    if lines is None:
+        return None
+
+    best_line = None
+    min_distance = float("inf")
+    line_segments = np.array(lines, dtype=np.int32).reshape(-1, 4)
+
+    for x1, y1, x2, y2 in line_segments:
+        distance = point_to_line_distance(center, (x1, y1), (x2, y2))
+        if distance < min_distance:
+            min_distance = distance
+            best_line = (x1, y1, x2, y2)
+
+    if best_line is None:
+        return None
+
+    x1, y1, x2, y2 = best_line
+
+    dist1 = np.hypot(x1 - center[0], y1 - center[1])
+    dist2 = np.hypot(x2 - center[0], y2 - center[1])
+
+    if dist1 > dist2:
+        tip_x, tip_y = x1, y1
+    else:
+        tip_x, tip_y = x2, y2
+
+    angle = np.arctan2(tip_y - center[1], tip_x - center[0])
+    angle_degrees = np.degrees(angle)
+
+    if angle_degrees < 0:
+        angle_degrees += 360
+
+    return angle_degrees
+
+
+def point_to_line_distance(point, line_start, line_end):
+    """Return perpendicular distance from point to a line segment."""
+
+    x0, y0 = point
+    x1, y1 = line_start
+    x2, y2 = line_end
+
+    num = abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1)
+    den = np.hypot(y2 - y1, x2 - x1)
+
+    if den == 0:
+        return float("inf")
+
+    return num / den
+
+
+def angle_to_temperature(angle, calibration=None):
+    """Convert a needle angle to temperature using calibration if available."""
+
+    if calibration:
+        zero_angle = calibration["zero_angle"]
+        max_angle = calibration["max_angle"]
+        min_temp = calibration["min_temp"]
+        max_temp = calibration["max_temp"]
+
+        relative_angle = angle - zero_angle
+        if relative_angle < 0:
+            relative_angle += 360
+
+        arc_span = max_angle - zero_angle
+        if arc_span < 0:
+            arc_span += 360
+
+        temp_range = max_temp - min_temp
+        if arc_span <= 0 or temp_range <= 0:
+            return round(min_temp, 1)
+
+        temperature = min_temp + (relative_angle / arc_span) * temp_range
+    else:
+        relative_angle = angle - GAUGE_ZERO_ANGLE
+        if relative_angle < 0:
+            relative_angle += 360
+
+        if GAUGE_ARC_DEGREES <= 0:
+            return round(GAUGE_MIN_TEMP, 1)
+
+        temp_range = GAUGE_MAX_TEMP - GAUGE_MIN_TEMP
+        if temp_range <= 0:
+            return round(GAUGE_MIN_TEMP, 1)
+
+        temperature = GAUGE_MIN_TEMP + (relative_angle / GAUGE_ARC_DEGREES) * temp_range
+
+    temperature = max(GAUGE_MIN_TEMP, min(GAUGE_MAX_TEMP, temperature))
+    return round(temperature, 1)
+
+
+def save_calibration(zero_angle, max_angle, min_temp, max_temp):
+    """Persist calibration data to disk."""
+
+    calibration = {
+        "zero_angle": zero_angle,
+        "max_angle": max_angle,
+        "min_temp": min_temp,
+        "max_temp": max_temp,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CALIBRATION_FILE, "w", encoding="utf-8") as handle:
+        json.dump(calibration, handle, indent=2)
+
+    print(f"Calibration saved: {calibration}")
+
+
+def load_calibration():
+    """Load calibration data if present."""
+
+    if CALIBRATION_FILE.exists():
+        with open(CALIBRATION_FILE, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    return None
+
+
+def read_gauge(image, calibration=None, debug=False):
+    """Read gauge temperature from an image, returning a result dict."""
+
+    result = {
+        "temperature_c": None,
+        "angle": None,
+        "confidence": "low",
+        "gauge_detected": False,
+        "needle_detected": False,
+        "notes": "",
+    }
+
+    gauge = detect_gauge_circle(image)
+    if gauge is None:
+        result["notes"] = "Could not detect gauge circle"
+        return result
+
+    result["gauge_detected"] = True
+    center_x, center_y, radius = gauge
+
+    if debug:
+        print(f"Gauge detected: center=({center_x}, {center_y}), radius={radius}")
+
+    cropped, new_center = crop_to_gauge(image, (center_x, center_y), radius)
+
+    angle = None
+    color_candidates = ["black", "red", "white"]
+    for extra_color in NEEDLE_COLOR_RANGE.keys():
+        if extra_color not in color_candidates:
+            color_candidates.append(extra_color)
+
+    for needle_color in color_candidates:
+        if needle_color not in NEEDLE_COLOR_RANGE:
+            continue
+        angle = detect_needle(cropped, new_center, radius, needle_color)
+        if angle is not None:
+            if debug:
+                print(f"Needle detected ({needle_color}): angle={angle:.1f}°")
+            break
+
+    if angle is None:
+        result["notes"] = "Could not detect needle"
+        return result
+
+    result["needle_detected"] = True
+    result["angle"] = angle
+
+    temperature = angle_to_temperature(angle, calibration)
+    result["temperature_c"] = temperature
+
+    result["confidence"] = "high" if angle is not None else "medium"
+    result["notes"] = f"Needle at {angle:.1f}° = {temperature}°C"
+
+    if debug:
+        print(f"Result: {result}")
+
+    return result
+
+
+def calibrate_gauge(image1, temp1, image2, temp2):
+    """Calibrate gauge using two known temperature readings."""
+
+    print(f"Calibrating with {temp1}°C and {temp2}°C...")
+
+    result1 = read_gauge(image1, calibration=None, debug=True)
+    result2 = read_gauge(image2, calibration=None, debug=True)
+
+    if result1["angle"] is None or result2["angle"] is None:
+        print("ERROR: Could not detect needle in one or both calibration images")
+        return False
+
+    angle1 = result1["angle"]
+    angle2 = result2["angle"]
+
+    print(f"Detected angles: {angle1}° at {temp1}°C, {angle2}° at {temp2}°C")
+
+    if temp1 < temp2:
+        zero_angle, max_angle = angle1, angle2
+        min_temp, max_temp = temp1, temp2
+    else:
+        zero_angle, max_angle = angle2, angle1
+        min_temp, max_temp = temp2, temp1
+
+    save_calibration(zero_angle, max_angle, min_temp, max_temp)
+    return True
+
+
+def test_on_image(image_path):
+    """Run the gauge reader on a single image."""
+
+    print(f"\nTesting gauge reading on: {image_path}")
+    print("=" * 60)
+
+    image = cv2.imread(str(image_path))
+    if image is None:
+        print(f"ERROR: Could not load image: {image_path}")
+        return None
+
+    calibration = load_calibration()
+    if calibration:
+        print(f"Using calibration: {calibration}")
+    else:
+        print("No calibration found, using default mapping")
+
+    result = read_gauge(image, calibration=calibration, debug=True)
+
+    print("\nFinal Result:")
+    print(f"  Temperature: {result['temperature_c']}°C")
+    print(f"  Confidence: {result['confidence']}")
+    print(f"  Notes: {result['notes']}")
+
+    return result
 
 
 def _normalize_config_path(candidate):
@@ -262,8 +620,18 @@ def save_state(state):
 # GPIO CONTROL
 # ============================================================================
 
+
+def _require_gpio():
+    if GPIO is None:
+        raise RuntimeError(
+            "RPi.GPIO module not available; monitoring requires Raspberry Pi hardware."
+        )
+
+
 def setup_gpio():
     """Initialize GPIO pins for IR LEDs"""
+    _require_gpio()
+    assert GPIO is not None
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
     
@@ -275,11 +643,15 @@ def setup_gpio():
 
 def ir_leds_on():
     """Turn on IR LEDs"""
+    _require_gpio()
+    assert GPIO is not None
     for pin in IR_LED_PINS:
         GPIO.output(pin, GPIO.HIGH)
 
 def ir_leds_off():
     """Turn off IR LEDs"""
+    _require_gpio()
+    assert GPIO is not None
     for pin in IR_LED_PINS:
         GPIO.output(pin, GPIO.LOW)
 
@@ -287,8 +659,18 @@ def ir_leds_off():
 # CAMERA CONTROL
 # ============================================================================
 
+
+def _require_camera():
+    if Picamera2 is None:
+        raise RuntimeError(
+            "picamera2 library not available; monitoring requires Raspberry Pi camera stack."
+        )
+
+
 def setup_camera():
     """Initialize and configure the camera"""
+    _require_camera()
+    assert Picamera2 is not None
     camera = Picamera2()
     
     config = camera.create_still_configuration(
@@ -721,33 +1103,11 @@ def run_monitoring_cycle(camera, state, calibration):
         )
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Monitor the pump status and temperature using local computer vision."
-    )
-    parser.add_argument(
-        "--config",
-        help="Path to settings JSON file overriding defaults"
-    )
-    return parser.parse_args()
-
-def main():
-    """Main entry point"""
-
-    args = parse_args()
-
-    if args.config:
-        try:
-            configure_from_file(args.config)
-        except FileNotFoundError:
-            print(f"ERROR: Settings file not found: {args.config}")
-            sys.exit(1)
-        except json.JSONDecodeError as exc:
-            print(f"ERROR: Invalid settings file '{args.config}': {exc}")
-            sys.exit(1)
+def run_monitor():
+    """Run the continuous monitoring loop."""
 
     prepare_storage()
-    
+
     log("=" * 60)
     log("PUMP MONITOR SYSTEM - FINAL VERSION")
     log("=" * 60)
@@ -763,47 +1123,118 @@ def main():
     log(f"Method: Local CV (Green LED + Needle Angle Detection)")
     log(f"Monthly cost: £0")
     log("")
-    
-    # Load state and calibration
+
     state = load_state()
     calibration = load_calibration()
-    
+
     if calibration:
         log(f"Loaded calibration: {calibration}")
     else:
         log("WARNING: No calibration found - using default mapping")
-        log("Recommend running: python3 gauge_reader.py calibrate ...")
-    
+        log("Recommend running: python3 pump_monitor.py calibrate <image1> <temp1> <image2> <temp2>")
+
     log("")
-    
-    # Setup hardware
-    setup_gpio()
-    camera = setup_camera()
-    
-    log("System ready. Starting monitoring loop...")
-    log("Press Ctrl+C to stop")
-    log("")
-    
+
+    camera = None
     try:
+        setup_gpio()
+        camera = setup_camera()
+
+        log("System ready. Starting monitoring loop...")
+        log("Press Ctrl+C to stop")
+        log("")
+
         while True:
             run_monitoring_cycle(camera, state, calibration)
-            
+
             log(f"Waiting {LED_CHECK_INTERVAL_SECONDS}s until next check...")
             log("")
             time.sleep(LED_CHECK_INTERVAL_SECONDS)
-            
+
     except KeyboardInterrupt:
         log("\nShutdown requested by user")
-    except Exception as e:
-        log(f"Fatal error: {e}")
+    except Exception as exc:
+        log(f"Fatal error: {exc}")
         import traceback
         log(traceback.format_exc())
     finally:
         log("Cleaning up...")
-        camera.stop()
-        ir_leds_off()
-        GPIO.cleanup()
+        if camera is not None:
+            camera.stop()
+        if GPIO is not None:
+            try:
+                ir_leds_off()
+            except RuntimeError:
+                pass
+            GPIO.cleanup()
         log("Pump monitor stopped")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Pump monitor and gauge utilities for the embedded camera system."
+    )
+    parser.add_argument(
+        "--config",
+        help="Path to settings JSON file overriding defaults"
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser(
+        "monitor",
+        help="Run the continuous monitoring loop"
+    )
+
+    test_parser = subparsers.add_parser(
+        "test-image",
+        help="Read temperature from a still image"
+    )
+    test_parser.add_argument("image_path", type=Path, help="Path to gauge image")
+
+    calibrate_parser = subparsers.add_parser(
+        "calibrate",
+        help="Calibrate the gauge using two reference images"
+    )
+    calibrate_parser.add_argument("image1", type=Path, help="Image captured at temp1")
+    calibrate_parser.add_argument("temp1", type=float, help="Known temperature for image1")
+    calibrate_parser.add_argument("image2", type=Path, help="Image captured at temp2")
+    calibrate_parser.add_argument("temp2", type=float, help="Known temperature for image2")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.config:
+        try:
+            configure_from_file(args.config)
+        except FileNotFoundError:
+            parser.error(f"Settings file not found: {args.config}")
+        except json.JSONDecodeError as exc:
+            parser.error(f"Invalid settings file '{args.config}': {exc}")
+
+    if args.command == "monitor":
+        run_monitor()
+    elif args.command == "test-image":
+        test_on_image(args.image_path)
+    elif args.command == "calibrate":
+        image1 = cv2.imread(str(args.image1))
+        image2 = cv2.imread(str(args.image2))
+
+        if image1 is None or image2 is None:
+            parser.error("Could not load one or both calibration images")
+
+        success = calibrate_gauge(image1, args.temp1, image2, args.temp2)
+        if success:
+            print("\nCalibration successful!")
+        else:
+            print("\nCalibration failed!")
+    else:  # pragma: no cover - defensive programming
+        parser.error(f"Unknown command: {args.command}")
+
 
 if __name__ == "__main__":
     main()

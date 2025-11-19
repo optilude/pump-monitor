@@ -5,7 +5,7 @@
 - **Raspberry Pi Zero 2 W** with fresh Pi OS installation
 - **Camera Module 3 NoIR** with Pi Zero camera cable
 - **2× IR LEDs (940nm)** connected to:
-  - LED 1: GPIO 17 (Pin 11) via 220Ω resistor → Ground (Pin 9)
+  - LED 1: GPIO 26 (Pin 37) via 220Ω resistor → Ground (Pin 39)
   - LED 2: GPIO 27 (Pin 13) via 220Ω resistor → Ground (Pin 14)
 - **Power supply** (5V, 2.5A micro-USB)
 
@@ -89,7 +89,7 @@ Paste:
 import RPi.GPIO as GPIO
 import time
 
-IR_LED_PINS = [17, 27]
+IR_LED_PINS = [26, 27]
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
@@ -98,11 +98,11 @@ for pin in IR_LED_PINS:
     GPIO.setup(pin, GPIO.OUT)
 
 print("Testing IR LEDs - view through phone camera!")
-print("LED 1 (GPIO 17) blinking...")
+print("LED 1 (GPIO 26) blinking...")
 for i in range(3):
-    GPIO.output(17, GPIO.HIGH)
+  GPIO.output(26, GPIO.HIGH)
     time.sleep(0.5)
-    GPIO.output(17, GPIO.LOW)
+  GPIO.output(26, GPIO.LOW)
     time.sleep(0.5)
 
 print("LED 2 (GPIO 27) blinking...")
@@ -113,11 +113,11 @@ for i in range(3):
     time.sleep(0.5)
 
 print("Both LEDs on for 3 seconds...")
-GPIO.output(17, GPIO.HIGH)
+GPIO.output(26, GPIO.HIGH)
 GPIO.output(27, GPIO.HIGH)
 time.sleep(3)
 
-GPIO.output(17, GPIO.LOW)
+GPIO.output(26, GPIO.LOW)
 GPIO.output(27, GPIO.LOW)
 GPIO.cleanup()
 print("Test complete!")
@@ -144,14 +144,14 @@ from picamera2 import Picamera2
 import RPi.GPIO as GPIO
 import time
 
-IR_LED_PINS = [17, 27]
+IR_LED_PINS = [26, 27]
 
 # Setup GPIO
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 for pin in IR_LED_PINS:
-    GPIO.setup(pin, GPIO.OUT)
-    GPIO.output(pin, GPIO.LOW)
+  GPIO.setup(pin, GPIO.OUT)
+  GPIO.output(pin, GPIO.LOW)
 
 # Setup camera
 camera = Picamera2()
@@ -164,11 +164,11 @@ print("Capturing WITHOUT IR...")
 camera.capture_file("test_no_ir.jpg")
 
 print("Capturing WITH IR...")
-GPIO.output(17, GPIO.HIGH)
+GPIO.output(26, GPIO.HIGH)
 GPIO.output(27, GPIO.HIGH)
 time.sleep(0.5)
 camera.capture_file("test_with_ir.jpg")
-GPIO.output(17, GPIO.LOW)
+GPIO.output(26, GPIO.LOW)
 GPIO.output(27, GPIO.LOW)
 
 print("Done! Images saved.")
@@ -199,23 +199,7 @@ mkdir -p ~/pump-monitor/images
 cd ~/pump-monitor
 ```
 
-### 3.2 Install Gauge Reader
-
-Create `gauge_reader.py`:
-```bash
-nano ~/pump-monitor/gauge_reader.py
-```
-
-**Copy the entire `gauge_reader.py` script from the artifact** and paste it into nano.
-
-Save: `Ctrl+X`, `Y`, `Enter`
-
-Make executable:
-```bash
-chmod +x ~/pump-monitor/gauge_reader.py
-```
-
-### 3.3 Install Main Monitor Script
+### 3.2 Install Pump Monitor Script
 
 Create `pump_monitor.py`:
 ```bash
@@ -231,7 +215,10 @@ Make executable:
 chmod +x ~/pump-monitor/pump_monitor.py
 ```
 
-### 3.4 Configure MQTT Settings
+> The single `pump_monitor.py` script now handles continuous monitoring as well as
+> the one-off `test-image` and `calibrate` helper commands.
+
+### 3.3 Configure MQTT Settings
 
 Edit configuration:
 ```bash
@@ -272,7 +259,7 @@ import RPi.GPIO as GPIO
 import time
 
 GPIO.setmode(GPIO.BCM)
-for pin in [17, 27]:
+for pin in [26, 27]:
     GPIO.setup(pin, GPIO.OUT)
     GPIO.output(pin, GPIO.HIGH)
 
@@ -283,8 +270,8 @@ time.sleep(2)
 camera.capture_file('positioning_test.jpg')
 camera.stop()
 
-for pin in [17, 27]:
-    GPIO.output(pin, GPIO.LOW)
+for pin in [26, 27]:
+  GPIO.output(pin, GPIO.LOW)
 GPIO.cleanup()
 print('Image captured: positioning_test.jpg')
 "
@@ -354,7 +341,7 @@ LED_MIN_AREA = 20  # Lower if LEDs are very small
 ### 5.2 Test Gauge Detection
 
 ```bash
-python3 ~/pump-monitor/gauge_reader.py test positioning_test.jpg
+python3 ~/pump-monitor/pump_monitor.py test-image positioning_test.jpg
 ```
 
 **Expected output:**
@@ -373,13 +360,13 @@ Final Result:
 
 **If gauge not detected:**
 ```bash
-nano ~/pump-monitor/gauge_reader.py
+nano ~/pump-monitor/pump_monitor.py
 ```
 
-Adjust:
+Adjust the values under `DEFAULT_SETTINGS["gauge"]`:
 ```python
-GAUGE_MIN_RADIUS = 20   # Lower if gauge is very small
-GAUGE_MAX_RADIUS = 300  # Higher if gauge is large
+"min_radius": 20,   # Lower if gauge is very small
+"max_radius": 300,  # Higher if gauge is large
 ```
 
 **If needle not detected:**
@@ -409,7 +396,7 @@ mv test_with_ir.jpg gauge_60c.jpg
 **Run calibration:**
 ```bash
 cd ~/pump-monitor
-python3 gauge_reader.py calibrate gauge_20c.jpg 20 gauge_60c.jpg 60
+python3 pump_monitor.py calibrate gauge_20c.jpg 20 gauge_60c.jpg 60
 ```
 
 **Expected output:**
@@ -446,7 +433,7 @@ Temp when OFF: 1800s (30.0 min)
 Method: Local CV (LED + Needle Angle Detection)
 Monthly cost: £0
 Loaded calibration: {...}
-GPIO initialized: IR LEDs on pins [17, 27]
+GPIO initialized: IR LEDs on pins [26, 27]
 Camera initialized: 1920x1080
 System ready
 ============================================================
@@ -746,7 +733,7 @@ python3 ~/test_camera_ir.py
 mv test_with_ir.jpg gauge_new2.jpg
 
 # Recalibrate
-python3 gauge_reader.py calibrate gauge_new1.jpg 25 gauge_new2.jpg 55
+python3 pump_monitor.py calibrate gauge_new1.jpg 25 gauge_new2.jpg 55
 
 # Restart service
 sudo systemctl start pump-monitor.service
@@ -792,10 +779,10 @@ If confidence low, adjust color range in `pump_monitor.py`.
 # Test manually
 cd ~/pump-monitor
 python3 ~/test_camera_ir.py
-python3 gauge_reader.py test test_with_ir.jpg
+python3 pump_monitor.py test-image test_with_ir.jpg
 ```
 
-Check radius parameters in `gauge_reader.py`.
+Check the gauge settings in `pump_monitor.py` under `DEFAULT_SETTINGS["gauge"]`.
 
 **Temperature readings incorrect:**
 - Recalibrate with known temperatures
@@ -869,7 +856,7 @@ sudo journalctl -u pump-monitor.service -f        # Service log
 ```bash
 python3 ~/test_leds.py                            # Test IR LEDs
 python3 ~/test_camera_ir.py                       # Test camera
-python3 ~/pump-monitor/gauge_reader.py test <img> # Test gauge reading
+python3 ~/pump-monitor/pump_monitor.py test-image <img> # Test gauge reading
 ```
 
 ## Success Criteria
