@@ -350,21 +350,6 @@ def _is_angle_in_valid_range(angle, calibration=None):
     return -tolerance <= relative_angle <= arc_span + tolerance
 
 
-def _normalize_needle_angle(angle, calibration=None):
-    """Normalize a needle angle, flipping by 180° if it appears to be detecting the wrong end."""
-    if _is_angle_in_valid_range(angle, calibration):
-        return angle
-
-    # Try flipping by 180°
-    flipped_angle = (angle + 180) % 360
-    if _is_angle_in_valid_range(flipped_angle, calibration):
-        return flipped_angle
-
-    # If neither works, return original angle
-    return angle
-
-
-
 def save_calibration(zero_angle, max_angle, min_temp, max_temp):
     """Persist calibration data to disk."""
 
@@ -553,16 +538,42 @@ def test_on_image(image_path):
     return result
 
 
-def _normalize_config_path(candidate):
-    path = Path(candidate).expanduser()
+def _resolve_path(value, base_dir=None):
+    """Resolve a path, making it absolute relative to base_dir or cwd.
+    
+    Args:
+        value: Path as string or Path object
+        base_dir: Base directory for relative paths (defaults to cwd)
+    
+    Returns:
+        Resolved absolute Path object
+    """
+    if base_dir is None:
+        base_dir = Path.cwd()
+    
+    path = Path(value).expanduser()
     if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
+        path = (base_dir / path).resolve()
     else:
         path = path.resolve()
     return path
 
 
 def merge_settings(defaults, overrides):
+    """Merge default and override settings dictionaries recursively.
+    
+    Args:
+        defaults: Dictionary of default settings
+        overrides: Dictionary of override settings
+        
+    Returns:
+        Merged settings dictionary
+    """
+    if not isinstance(defaults, dict):
+        raise TypeError(f"defaults must be a dict, got {type(defaults).__name__}")
+    if not isinstance(overrides, dict):
+        raise TypeError(f"overrides must be a dict, got {type(overrides).__name__}")
+    
     result = {}
     keys = set(defaults.keys()) | set(overrides.keys())
     for key in keys:
@@ -638,20 +649,13 @@ def apply_pump_settings(settings, base_dir):
     return CONFIG
 
 
-def _resolve_path(value, base_dir):
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = (base_dir / path).resolve()
-    return path
-
-
 def configure_from_file(config_path=None):
     global CURRENT_CONFIG_PATH
 
     if config_path is None:
-        path = _normalize_config_path(DEFAULT_CONFIG_PATH)
+        path = _resolve_path(DEFAULT_CONFIG_PATH)
     else:
-        path = _normalize_config_path(config_path)
+        path = _resolve_path(config_path)
 
     with open(path, "r", encoding="utf-8") as handle:
         overrides = json.load(handle)
@@ -700,7 +704,7 @@ def log(message):
 # ============================================================================
 
 def load_state():
-    """Load persistent state"""
+    """Load persistent state with validation"""
     default_state = {
         "last_temp_check": None,
         "last_temperature": None,
@@ -709,35 +713,60 @@ def load_state():
     }
     
     if STATE_FILE is None:
-        return default_state
+        return default_state.copy()
 
-    if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE, 'r') as f:
-                state = json.load(f)
-            log("Loaded previous state")
-            # Validate loaded state has expected keys
-            for key in default_state:
-                if key not in state:
-                    log(f"Warning: Missing key '{key}' in state file, using default")
-                    state[key] = default_state[key]
-            return state
-        except (json.JSONDecodeError, ValueError) as e:
-            log(f"State file corrupted: {e}, using defaults")
-        except Exception as e:
-            log(f"Error loading state: {e}, using defaults")
+    if not STATE_FILE.exists():
+        return default_state.copy()
     
-    return default_state
+    try:
+        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        
+        # Validate state is a dict
+        if not isinstance(state, dict):
+            log(f"State file has invalid format (not a dict), using defaults")
+            return default_state.copy()
+        
+        # Merge with defaults to ensure all keys exist
+        merged_state = default_state.copy()
+        for key in default_state:
+            if key in state:
+                merged_state[key] = state[key]
+            else:
+                log(f"Warning: Missing key '{key}' in state file, using default")
+        
+        log("Loaded previous state")
+        return merged_state
+        
+    except json.JSONDecodeError as e:
+        log(f"State file corrupted: {e}, using defaults")
+        return default_state.copy()
+    except (OSError, IOError) as e:
+        log(f"Error reading state file: {e}, using defaults")
+        return default_state.copy()
+    except Exception as e:
+        log(f"Unexpected error loading state: {e}, using defaults")
+        return default_state.copy()
 
 def save_state(state):
     """Save persistent state"""
+    if STATE_FILE is None:
+        return
+    
+    if not isinstance(state, dict):
+        log(f"Error saving state: invalid state type {type(state)}")
+        return
+    
     try:
-        if STATE_FILE is None:
-            return
-        with open(STATE_FILE, 'w') as f:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
             json.dump(state, f, indent=2)
+    except (OSError, IOError) as e:
+        log(f"Error writing state file: {e}")
+    except TypeError as e:
+        log(f"Error serializing state: {e}")
     except Exception as e:
-        log(f"Error saving state: {e}")
+        log(f"Unexpected error saving state: {e}")
 
 # ============================================================================
 # GPIO CONTROL
