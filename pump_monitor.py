@@ -306,15 +306,15 @@ def setup_camera():
 def capture_image_with_ir(camera):
     """Capture image with IR illumination"""
     ir_leds_on()
-    time.sleep(0.5)  # Let IR stabilize
-    
-    image_array = camera.capture_array()
-    
-    ir_leds_off()
-    
+    try:
+        time.sleep(0.5)  # Let IR stabilize
+        image_array = camera.capture_array()
+    finally:
+        ir_leds_off()
+
     # Convert from RGB to BGR for OpenCV
     image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
-    
+
     return image_bgr
 
 def save_image(image, timestamp, suffix=""):
@@ -324,29 +324,44 @@ def save_image(image, timestamp, suffix=""):
     log(f"Image saved: {filename.name}")
     return filename
 
+
+def _parse_image_timestamp(image_file: Path):
+    """Attempt to parse the timestamp embedded in a pump_YYYYMMDD_HHMMSS*.jpg name."""
+    parts = image_file.stem.split('_')
+    if len(parts) < 3:
+        return None
+
+    date_part = parts[1]
+    time_part = parts[2]
+    time_digits = ''.join(ch for ch in time_part if ch.isdigit())
+    if len(date_part) != 8 or len(time_digits) < 6:
+        return None
+
+    try:
+        return datetime.strptime(f"{date_part}_{time_digits[:6]}", "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+
 def cleanup_old_images():
     """Remove images older than retention period"""
-    if IMAGE_DIR is None:
+    if IMAGE_DIR is None or not IMAGE_DIR.exists():
         return
 
     cutoff_time = datetime.now() - timedelta(hours=IMAGE_RETENTION_HOURS)
-    
+
     deleted_count = 0
     for image_file in IMAGE_DIR.glob("pump_*.jpg"):
         try:
-            parts = image_file.stem.split('_')
-            if len(parts) >= 2:
-                timestamp_str = parts[1]
-                # Extract just the date part
-                date_str = timestamp_str[:8]  # YYYYMMDD
-                file_time = datetime.strptime(date_str, '%Y%m%d')
-                
-                if file_time < cutoff_time:
-                    image_file.unlink()
-                    deleted_count += 1
+            file_time = _parse_image_timestamp(image_file)
+            if file_time is None:
+                file_time = datetime.fromtimestamp(image_file.stat().st_mtime)
+
+            if file_time < cutoff_time:
+                image_file.unlink()
+                deleted_count += 1
         except Exception as e:
             log(f"Error checking file {image_file.name}: {e}")
-    
+
     if deleted_count > 0:
         log(f"Cleaned up {deleted_count} old images")
 
@@ -354,20 +369,56 @@ def cleanup_old_images():
 # GREEN LED DETECTION (Pump Status)
 # ============================================================================
 
+
+def _clamp_region(region, width, height):
+    """Ensure a persisted ROI stays inside the image bounds."""
+    if not region:
+        return None
+
+    try:
+        x, y, w, h = (int(value) for value in region)
+    except (TypeError, ValueError):
+        return None
+
+    if w <= 0 or h <= 0 or width <= 0 or height <= 0:
+        return None
+
+    width = max(1, width)
+    height = max(1, height)
+    x = max(0, min(x, width - 1))
+    y = max(0, min(y, height - 1))
+
+    max_w = width - x
+    max_h = height - y
+    if max_w <= 0 or max_h <= 0:
+        return None
+
+    w = max(1, min(w, max_w))
+    h = max(1, min(h, max_h))
+    return (x, y, w, h)
+
+
 def detect_pump_leds(image, region=None):
     """
     Detect green LEDs on pump face (handles multiple LEDs)
     Returns: (is_on: bool, confidence: float, led_positions: list)
     """
-    
-    if region:
-        x, y, w, h = region
+    height, width = image.shape[:2]
+    sanitized_region = _clamp_region(region, width, height)
+
+    if sanitized_region:
+        x, y, w, h = sanitized_region
         roi = image[y:y+h, x:x+w]
-        offset = (x, y)
+        if roi.size == 0:
+            roi = image
+            offset = (0, 0)
+            sanitized_region = None
+        else:
+            offset = (x, y)
     else:
         roi = image
         offset = (0, 0)
-    
+
     # Convert to HSV
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     
@@ -407,7 +458,7 @@ def detect_pump_leds(image, region=None):
     
     # Confidence based on number of LEDs found and brightness
     green_pixels = cv2.countNonZero(mask)
-    total_pixels = roi.shape[0] * roi.shape[1]
+    total_pixels = max(1, roi.shape[0] * roi.shape[1])
     green_percentage = (green_pixels / total_pixels) * 100
     
     # Higher confidence if multiple LEDs detected (as expected)
@@ -418,15 +469,19 @@ def detect_pump_leds(image, region=None):
         f"conf: {confidence:.1f}%, status LED at {status_led['center']})")
     
     # Return detected region for future optimization
-    if led_contours and not region:
+    detected_region = sanitized_region
+
+    if led_contours and sanitized_region is None:
         # Calculate bounding box around all LEDs
         all_x = [led['center'][0] for led in led_contours]
         all_y = [led['center'][1] for led in led_contours]
         x_min, x_max = min(all_x) - 50, max(all_x) + 50
         y_min, y_max = min(all_y) - 50, max(all_y) + 50
-        detected_region = (x_min, y_min, x_max - x_min, y_max - y_min)
-    else:
-        detected_region = region
+        new_region = _clamp_region(
+            (x_min, y_min, x_max - x_min, y_max - y_min), width, height
+        )
+        if new_region:
+            detected_region = new_region
     
     return is_on, confidence, detected_region
 
@@ -436,44 +491,99 @@ def detect_pump_leds(image, region=None):
 
 def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, notes):
     """Publish pump status to Home Assistant via MQTT"""
-    
+    client = None
+    loop_running = False
+    connected = False
+
     try:
         client = mqtt.Client(client_id="pump_monitor", protocol=mqtt.MQTTv311)
-        
+
         if MQTT_USER and MQTT_PASS:
             client.username_pw_set(MQTT_USER, MQTT_PASS)
-        
+
         client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-        
+        connected = True
+
+        client.loop_start()
+        loop_running = True
+
         timestamp = datetime.now().isoformat()
-        
-        # Publish pump status
-        client.publish(f"{MQTT_TOPIC_PREFIX}/status", 
-                      "on" if pump_on else "off", retain=True)
-        
-        # Publish temperature
+        publish_calls = []
+
+        publish_calls.append(
+            client.publish(
+                f"{MQTT_TOPIC_PREFIX}/status",
+                "on" if pump_on else "off",
+                retain=True,
+            )
+        )
+
         if temperature_c is not None:
-            client.publish(f"{MQTT_TOPIC_PREFIX}/temperature", 
-                          str(temperature_c), retain=True)
-        
-        # Publish metadata
-        client.publish(f"{MQTT_TOPIC_PREFIX}/last_check", timestamp, retain=True)
-        client.publish(f"{MQTT_TOPIC_PREFIX}/led_confidence", 
-                      f"{led_confidence:.0f}%", retain=True)
-        
+            publish_calls.append(
+                client.publish(
+                    f"{MQTT_TOPIC_PREFIX}/temperature",
+                    str(temperature_c),
+                    retain=True,
+                )
+            )
+
+        publish_calls.append(
+            client.publish(
+                f"{MQTT_TOPIC_PREFIX}/last_check",
+                timestamp,
+                retain=True,
+            )
+        )
+        publish_calls.append(
+            client.publish(
+                f"{MQTT_TOPIC_PREFIX}/led_confidence",
+                f"{led_confidence:.0f}%",
+                retain=True,
+            )
+        )
+
         if temp_confidence:
-            client.publish(f"{MQTT_TOPIC_PREFIX}/temp_confidence", 
-                          temp_confidence, retain=True)
-        
+            publish_calls.append(
+                client.publish(
+                    f"{MQTT_TOPIC_PREFIX}/temp_confidence",
+                    temp_confidence,
+                    retain=True,
+                )
+            )
+
         if notes:
-            client.publish(f"{MQTT_TOPIC_PREFIX}/notes", notes, retain=True)
-        
+            publish_calls.append(
+                client.publish(
+                    f"{MQTT_TOPIC_PREFIX}/notes",
+                    str(notes),
+                    retain=True,
+                )
+            )
+
+        for info in publish_calls:
+            try:
+                info.wait_for_publish()
+            except Exception as publish_error:
+                log(f"MQTT publish wait error: {publish_error}")
+
         client.disconnect()
-        
+        connected = False
+
         log(f"Published to MQTT: pump={'on' if pump_on else 'off'}, temp={temperature_c}°C")
-        
+
     except Exception as e:
         log(f"MQTT error: {e}")
+    finally:
+        if connected and client is not None:
+            try:
+                client.disconnect()
+            except Exception as disconnect_error:
+                log(f"MQTT disconnect error: {disconnect_error}")
+        if loop_running and client is not None:
+            try:
+                client.loop_stop()
+            except Exception as loop_error:
+                log(f"MQTT loop stop error: {loop_error}")
 
 # ============================================================================
 # SMART SCHEDULING
@@ -493,10 +603,11 @@ def should_check_temperature(state):
     # Calculate time since last check
     try:
         last_check_time = datetime.fromisoformat(last_check)
-        elapsed_seconds = (datetime.now() - last_check_time).total_seconds()
-    except:
+    except (TypeError, ValueError):
         log("Could not parse last check time, checking temperature")
         return True
+
+    elapsed_seconds = (datetime.now() - last_check_time).total_seconds()
     
     # Determine interval based on pump status
     if pump_on:
@@ -533,15 +644,19 @@ def run_monitoring_cycle(camera, state, calibration):
         
         # Always detect LED status (local CV - free and fast)
         log("Detecting LED status...")
+        previous_region = state.get('led_region')
         led_on, led_confidence, detected_led_region = detect_pump_leds(
-            image, 
-            state.get('led_region')
+            image,
+            previous_region,
         )
-        
-        # Update LED region if detected and not already set
-        if detected_led_region and not state.get('led_region'):
-            state['led_region'] = detected_led_region
-            log(f"LED region saved: {detected_led_region}")
+
+        if detected_led_region:
+            if detected_led_region != previous_region:
+                state['led_region'] = detected_led_region
+                log(f"LED region updated: {detected_led_region}")
+        elif previous_region:
+            state['led_region'] = None
+            log("LED region cleared")
         
         # Update pump status in state
         state['pump_on'] = led_on

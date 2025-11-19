@@ -204,7 +204,7 @@ def detect_needle(image, center, radius, needle_color='black'):
     
     # Try to detect needle by color
     lower, upper = NEEDLE_COLOR_RANGE[needle_color]
-    color_mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+    color_mask = cv2.inRange(hsv, lower, upper)
     
     # Combine with gauge mask
     needle_mask = cv2.bitwise_and(color_mask, mask)
@@ -307,9 +307,11 @@ def angle_to_temperature(angle, calibration=None):
         arc_span = max_angle - zero_angle
         if arc_span < 0:
             arc_span += 360
-        
-        # Calculate temperature
+
         temp_range = max_temp - min_temp
+        if arc_span <= 0 or temp_range <= 0:
+            return round(min_temp, 1)
+
         temperature = min_temp + (relative_angle / arc_span) * temp_range
         
     else:
@@ -319,7 +321,14 @@ def angle_to_temperature(angle, calibration=None):
             relative_angle += 360
         
         # Map to temperature
-        temperature = (relative_angle / GAUGE_ARC_DEGREES) * GAUGE_MAX_TEMP
+        if GAUGE_ARC_DEGREES <= 0:
+            return round(GAUGE_MIN_TEMP, 1)
+
+        temp_range = GAUGE_MAX_TEMP - GAUGE_MIN_TEMP
+        if temp_range <= 0:
+            return round(GAUGE_MIN_TEMP, 1)
+
+        temperature = GAUGE_MIN_TEMP + (relative_angle / GAUGE_ARC_DEGREES) * temp_range
     
     # Clamp to valid range
     temperature = max(GAUGE_MIN_TEMP, min(GAUGE_MAX_TEMP, temperature))
@@ -341,7 +350,7 @@ def save_calibration(zero_angle, max_angle, min_temp, max_temp):
     }
     
     CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CALIBRATION_FILE, 'w') as f:
+    with open(CALIBRATION_FILE, 'w', encoding='utf-8') as f:
         json.dump(calibration, f, indent=2)
     
     print(f"Calibration saved: {calibration}")
@@ -349,7 +358,7 @@ def save_calibration(zero_angle, max_angle, min_temp, max_temp):
 def load_calibration():
     """Load calibration data"""
     if CALIBRATION_FILE.exists():
-        with open(CALIBRATION_FILE, 'r') as f:
+        with open(CALIBRATION_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     return None
 
