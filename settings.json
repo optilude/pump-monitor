@@ -30,8 +30,8 @@
     "max_temp": 80,
     "arc_degrees": 270,
     "zero_angle": 225,
-    "min_radius": 30,
-    "max_radius": 200,
+    "min_radius": 80,
+    "max_radius": 130,
     "needle_color_range": {
       "black": [[0, 0, 0], [180, 255, 80]],
       "red": [[0, 100, 100], [10, 255, 255]],

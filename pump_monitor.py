@@ -63,8 +63,8 @@ DEFAULT_SETTINGS = {
         "max_temp": 80,
         "arc_degrees": 270,
         "zero_angle": 225,
-        "min_radius": 30,
-        "max_radius": 200,
+        "min_radius": 80,
+        "max_radius": 130,
         "needle_color_range": {
             "black": [[0, 0, 0], [180, 255, 80]],
             "red": [[0, 100, 100], [10, 255, 255]],
@@ -176,11 +176,12 @@ def crop_to_gauge(image, center, radius):
     return cropped, new_center
 
 
-def detect_needle(image, center, radius, needle_color="black"):
+def detect_needle(image, center, radius):
     """Detect the needle angle in degrees, or return None if not found.
     
-    Uses improved multi-strategy edge detection from pump_vision.py for better
-    reliability across different lighting conditions.
+    Uses improved multi-strategy edge detection for better reliability across
+    different lighting conditions. Color-based detection removed as edge-based
+    approach is more reliable.
     """
     cx, cy = center
     
@@ -416,37 +417,22 @@ def read_gauge(image, calibration=None, debug=False):
 
     cropped, new_center = crop_to_gauge(image, (center_x, center_y), radius)
 
-    # Try all needle colors and collect detections
-    angle = None
-    detected_angles = []
-    color_candidates = ["black", "red", "white"]
-    for extra_color in NEEDLE_COLOR_RANGE.keys():
-        if extra_color not in color_candidates:
-            color_candidates.append(extra_color)
-
-    for needle_color in color_candidates:
-        if needle_color not in NEEDLE_COLOR_RANGE:
-            continue
-        detected_angle = detect_needle(cropped, new_center, radius, needle_color)
-        if detected_angle is not None:
-            detected_angles.append((needle_color, detected_angle))
-            if debug:
-                print(f"Needle detected ({needle_color}): angle={detected_angle:.1f}°")
+    # Detect needle using edge-based detection
+    angle = detect_needle(cropped, new_center, radius)
     
-    if not detected_angles:
+    if angle is None:
         result["notes"] = "Could not detect needle"
         return result
     
-    # Choose the best angle: try each detected angle both raw and flipped,
-    # and select based purely on which gives the most reasonable temperature.
+    if debug:
+        print(f"Needle detected: angle={angle:.1f}°")
+    
+    # Try both the raw angle and flipped version to find best temperature match
     best_angle = None
     best_temp = None
-    best_color = None
     best_score = float('inf')
     
-    for color, detected_angle in detected_angles:
-        # Try both the raw angle and the flipped version
-        for angle_to_try in [detected_angle, (detected_angle + 180) % 360]:
+    for angle_to_try in [angle, (angle + 180) % 360]:
             # Check if this angle is in the valid calibration range
             is_in_range = _is_angle_in_valid_range(angle_to_try, calibration)
             
@@ -480,29 +466,22 @@ def read_gauge(image, calibration=None, debug=False):
                     else:  # temp > 60
                         score += (temp - 60) * 2
             
-            was_flipped = (abs(angle_to_try - detected_angle) > 1.0)
+            was_flipped = (abs(angle_to_try - angle) > 1.0)
             flip_str = "(flipped)" if was_flipped else ""
             
             if debug:
                 in_arc_str = "in-arc" if is_in_range else "out-arc"
-                print(f"  {color}: {detected_angle:.1f}° → {angle_to_try:.1f}° {flip_str} [{in_arc_str}] → {temp:.1f}°C (score: {score:.1f})")
+                print(f"  {angle:.1f}° → {angle_to_try:.1f}° {flip_str} [{in_arc_str}] → {temp:.1f}°C (score: {score:.1f})")
             
             if score < best_score:
                 best_angle = angle_to_try
                 best_temp = temp
-                best_color = color
                 best_score = score
     
-    # If none were scored, just use the first detection
+    # Use selected angle and temperature
     if best_angle is None:
-        best_color, detected_angle = detected_angles[0]
-        best_angle = detected_angle
+        best_angle = angle
         best_temp = angle_to_temperature(best_angle, calibration)
-    
-    if debug and len(detected_angles) > 1:
-        print(f"  → Selected {best_color} needle at {best_angle:.1f}°")
-    
-    angle = best_angle
 
     result["needle_detected"] = True
     
@@ -738,9 +717,16 @@ def load_state():
             with open(STATE_FILE, 'r') as f:
                 state = json.load(f)
             log("Loaded previous state")
+            # Validate loaded state has expected keys
+            for key in default_state:
+                if key not in state:
+                    log(f"Warning: Missing key '{key}' in state file, using default")
+                    state[key] = default_state[key]
             return state
+        except (json.JSONDecodeError, ValueError) as e:
+            log(f"State file corrupted: {e}, using defaults")
         except Exception as e:
-            log(f"Error loading state: {e}")
+            log(f"Error loading state: {e}, using defaults")
     
     return default_state
 
@@ -984,11 +970,12 @@ def detect_pump_leds(image, region=None):
         # - Larger LED area
         # - More green pixels overall
         # - Multiple LEDs detected (typical for this pump)
-        confidence = min(100, largest_led['area'] / 10 + 
-                       (green_pixels / total_pixels * 100) * 2 + 
-                       num_leds * 10)
+        confidence = min(100.0, max(0.0, 
+                       largest_led['area'] / 10.0 + 
+                       (green_pixels / total_pixels * 100.0) * 2.0 + 
+                       num_leds * 10.0))
     else:
-        confidence = 0
+        confidence = 0.0
     
     log(f"LED: {'ON' if is_on else 'OFF'} ({num_leds} LED(s) detected, "
         f"conf: {confidence:.1f}%)")
@@ -1030,6 +1017,7 @@ def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, not
 
         client.loop_start()
         loop_running = True
+        time.sleep(0.1)  # Brief pause to ensure loop is running
 
         timestamp = datetime.now().isoformat()
         publish_calls = []
@@ -1043,13 +1031,17 @@ def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, not
         )
 
         if temperature_c is not None:
-            publish_calls.append(
-                client.publish(
-                    f"{MQTT_TOPIC_PREFIX}/temperature",
-                    str(temperature_c),
-                    retain=True,
+            # Validate temperature is within reasonable range
+            if GAUGE_MIN_TEMP <= temperature_c <= GAUGE_MAX_TEMP:
+                publish_calls.append(
+                    client.publish(
+                        f"{MQTT_TOPIC_PREFIX}/temperature",
+                        str(temperature_c),
+                        retain=True,
+                    )
                 )
-            )
+            else:
+                log(f"Warning: Temperature {temperature_c}°C outside valid range [{GAUGE_MIN_TEMP}, {GAUGE_MAX_TEMP}]")
 
         publish_calls.append(
             client.publish(
@@ -1233,16 +1225,24 @@ def run_monitoring_cycle(camera, state, calibration):
         
         log("Cycle complete")
         
+    except KeyboardInterrupt:
+        raise  # Re-raise to allow graceful shutdown
     except Exception as e:
         log(f"Cycle error: {e}")
-        # Publish error state
-        publish_to_mqtt(
-            pump_on=False,
-            temperature_c=None,
-            led_confidence=0,
-            temp_confidence='low',
-            notes=f'Error: {str(e)}'
-        )
+        import traceback
+        log(f"Traceback: {traceback.format_exc()}")
+        
+        # Try to publish error state, but don't fail if MQTT is the problem
+        try:
+            publish_to_mqtt(
+                pump_on=state.get('pump_on', False),  # Use last known state
+                temperature_c=state.get('last_temperature'),
+                led_confidence=0,
+                temp_confidence='low',
+                notes=f'Error: {str(e)}'
+            )
+        except Exception as mqtt_err:
+            log(f"Could not publish error state: {mqtt_err}")
 
 
 def run_monitor():
