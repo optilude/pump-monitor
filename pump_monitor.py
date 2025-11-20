@@ -71,6 +71,11 @@ DEFAULT_SETTINGS = {
             "white": [[0, 0, 200], [180, 30, 255]]
         },
         "calibration_file": "gauge_calibration.json"
+    },
+    "reliability": {
+        "min_temp_confidence": "high",
+        "min_led_confidence_pct": 10.0,
+        "publish_quality_metrics": True
     }
 }
 CONFIG: dict = {}
@@ -191,7 +196,8 @@ def detect_needle(image, center, radius):
 
     # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
     # This normalizes contrast across the image, helping with both dark and bright images
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    # Higher clipLimit (4.0) helps with ambient lighting conditions
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
     # Apply bilateral filter to reduce noise while keeping edges sharp
@@ -228,7 +234,8 @@ def detect_needle(image, center, radius):
     darkness_scores = np.array(darkness_scores)
 
     # Smooth the scores to reduce noise
-    window_size = 5
+    # Larger window (7) helps stabilize detection across varying lighting
+    window_size = 7
     smoothed = np.convolve(darkness_scores, np.ones(window_size)/window_size, mode='same')
 
     # Calculate contrast
@@ -463,14 +470,14 @@ def read_gauge(image, calibration=None, debug=False):
         best_temp = angle_to_temperature(best_angle, calibration)
 
     result["needle_detected"] = True
-    
-    result["angle"] = angle
+
+    result["angle"] = best_angle
 
     temperature = best_temp
     result["temperature_c"] = temperature
 
     result["confidence"] = "high" if angle is not None else "medium"
-    result["notes"] = f"Needle at {angle:.1f}° = {temperature}°C"
+    result["notes"] = f"Needle at {best_angle:.1f}° = {temperature}°C"
 
     if debug:
         print(f"Result: {result}")
@@ -603,12 +610,16 @@ def _apply_config_dict(settings, base_dir):
     global IMAGE_DIR
     global LOG_FILE
     global STATE_FILE
+    global MIN_TEMP_CONFIDENCE
+    global MIN_LED_CONFIDENCE_PCT
+    global PUBLISH_QUALITY_METRICS
 
     mqtt_config = settings["mqtt"]
     led_config = settings["led_detection"]
     gpio_config = settings["gpio"]
     timing_config = settings["timing"]
     storage_config = settings["storage"]
+    reliability_config = settings.get("reliability", DEFAULT_SETTINGS["reliability"])
 
     MQTT_BROKER = mqtt_config["broker"]
     MQTT_PORT = int(mqtt_config["port"])
@@ -630,6 +641,10 @@ def _apply_config_dict(settings, base_dir):
     IMAGE_DIR = _resolve_path(storage_config["image_dir"], base_dir)
     LOG_FILE = _resolve_path(storage_config["log_file"], base_dir)
     STATE_FILE = _resolve_path(storage_config["state_file"], base_dir)
+
+    MIN_TEMP_CONFIDENCE = reliability_config.get("min_temp_confidence", "high")
+    MIN_LED_CONFIDENCE_PCT = float(reliability_config.get("min_led_confidence_pct", 10.0))
+    PUBLISH_QUALITY_METRICS = bool(reliability_config.get("publish_quality_metrics", True))
 
     apply_gauge_settings(settings, base_dir)
 
@@ -1023,8 +1038,8 @@ def detect_pump_leds(image, region=None):
 # MQTT / HOME ASSISTANT
 # ============================================================================
 
-def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, notes):
-    """Publish pump status to Home Assistant via MQTT"""
+def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, notes, gauge_detected=False, needle_detected=False, angle=None):
+    """Publish pump status to Home Assistant via MQTT with reliability safeguards"""
     client = None
     loop_running = False
     connected = False
@@ -1045,15 +1060,22 @@ def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, not
         timestamp = datetime.now().isoformat()
         publish_calls = []
 
-        publish_calls.append(
-            client.publish(
-                f"{MQTT_TOPIC_PREFIX}/status",
-                "on" if pump_on else "off",
-                retain=True,
+        # Publish pump status only if LED detection is confident
+        # Always publish "off" state (false negatives less critical than false positives)
+        if led_confidence >= MIN_LED_CONFIDENCE_PCT or not pump_on:
+            publish_calls.append(
+                client.publish(
+                    f"{MQTT_TOPIC_PREFIX}/status",
+                    "on" if pump_on else "off",
+                    retain=True,
+                )
             )
-        )
+        else:
+            log(f"Skipping status publish: LED confidence too low ({led_confidence:.1f}%)")
 
-        if temperature_c is not None:
+        # Publish temperature only if confidence meets threshold
+        temperature_published = False
+        if temperature_c is not None and temp_confidence == MIN_TEMP_CONFIDENCE:
             # Validate temperature is within reasonable range
             if GAUGE_MIN_TEMP <= temperature_c <= GAUGE_MAX_TEMP:
                 publish_calls.append(
@@ -1063,8 +1085,30 @@ def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, not
                         retain=True,
                     )
                 )
+                temperature_published = True
             else:
                 log(f"Warning: Temperature {temperature_c}°C outside valid range [{GAUGE_MIN_TEMP}, {GAUGE_MAX_TEMP}]")
+        elif temperature_c is not None and temp_confidence != MIN_TEMP_CONFIDENCE:
+            log(f"Skipping temperature publish: confidence={temp_confidence}, temp={temperature_c}°C (required: {MIN_TEMP_CONFIDENCE})")
+
+        # Publish temperature validity indicator for Home Assistant
+        publish_calls.append(
+            client.publish(
+                f"{MQTT_TOPIC_PREFIX}/temperature_valid",
+                "true" if temperature_published else "false",
+                retain=True,
+            )
+        )
+
+        # Publish availability status
+        is_available = temperature_published or (temperature_c is None and temp_confidence is not None)
+        publish_calls.append(
+            client.publish(
+                f"{MQTT_TOPIC_PREFIX}/available",
+                "online" if is_available else "offline",
+                retain=True,
+            )
+        )
 
         publish_calls.append(
             client.publish(
@@ -1099,6 +1143,25 @@ def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, not
                 )
             )
 
+        # Publish detailed quality metrics (non-retained for diagnostics)
+        if PUBLISH_QUALITY_METRICS:
+            quality_data = {
+                "gauge_detected": gauge_detected,
+                "needle_detected": needle_detected,
+                "temp_confidence": temp_confidence if temp_confidence else "none",
+                "led_confidence_pct": round(led_confidence, 1),
+                "angle": round(angle, 1) if angle is not None else None,
+                "temperature_published": temperature_published,
+                "timestamp": timestamp
+            }
+            publish_calls.append(
+                client.publish(
+                    f"{MQTT_TOPIC_PREFIX}/detection_quality",
+                    json.dumps(quality_data),
+                    retain=False,  # Don't retain diagnostic data
+                )
+            )
+
         for info in publish_calls:
             try:
                 info.wait_for_publish()
@@ -1108,7 +1171,7 @@ def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, not
         client.disconnect()
         connected = False
 
-        log(f"Published to MQTT: pump={'on' if pump_on else 'off'}, temp={temperature_c}°C")
+        log(f"Published to MQTT: pump={'on' if pump_on else 'off'}, temp={temperature_c}°C (valid: {temperature_published})")
 
     except Exception as e:
         log(f"MQTT error: {e}")
@@ -1208,28 +1271,36 @@ def run_monitoring_cycle(camera, state, calibration):
         temp_confidence = None
         temp_notes = ""
         
+        # Initialize detection result variables
+        gauge_detected = False
+        needle_detected = False
+        angle = None
+
         if check_temp:
             # Read temperature with CV needle detection
             log("Reading temperature gauge (needle angle detection)...")
-            
+
             result = read_gauge(image, calibration=calibration, debug=False)
-            
+
             temperature = result.get('temperature_c')
             temp_confidence = result.get('confidence', 'low')
             temp_notes = result.get('notes', '')
-            
+            gauge_detected = result.get('gauge_detected', False)
+            needle_detected = result.get('needle_detected', False)
+            angle = result.get('angle')
+
             # Update state
             state['last_temp_check'] = datetime.now().isoformat()
             if temperature is not None:
                 state['last_temperature'] = temperature
-            
+
             # Save image when temperature is checked
             save_image(image, timestamp, suffix="_temp")
         else:
             # Save LED check image occasionally (every 15 minutes)
             if timestamp.minute % 15 == 0:
                 save_image(image, timestamp, suffix="_led")
-        
+
         # Publish to Home Assistant
         log("Publishing to Home Assistant...")
         publish_to_mqtt(
@@ -1237,7 +1308,10 @@ def run_monitoring_cycle(camera, state, calibration):
             temperature_c=temperature,
             led_confidence=led_confidence,
             temp_confidence=temp_confidence,
-            notes=temp_notes
+            notes=temp_notes,
+            gauge_detected=gauge_detected,
+            needle_detected=needle_detected,
+            angle=angle
         )
         
         # Save state
@@ -1262,7 +1336,10 @@ def run_monitoring_cycle(camera, state, calibration):
                 temperature_c=state.get('last_temperature'),
                 led_confidence=0,
                 temp_confidence='low',
-                notes=f'Error: {str(e)}'
+                notes=f'Error: {str(e)}',
+                gauge_detected=False,
+                needle_detected=False,
+                angle=None
             )
         except Exception as mqtt_err:
             log(f"Could not publish error state: {mqtt_err}")
