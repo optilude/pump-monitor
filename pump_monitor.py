@@ -178,86 +178,73 @@ def crop_to_gauge(image, center, radius):
 
 def detect_needle(image, center, radius):
     """Detect the needle angle in degrees, or return None if not found.
-    
-    Uses improved multi-strategy edge detection for better reliability across
-    different lighting conditions. Color-based detection removed as edge-based
-    approach is more reliable.
+
+    Uses radial darkness analysis with CLAHE enhancement for robust detection
+    across different lighting conditions (ambient, dark, IR-illuminated).
+    This approach analyzes darkness along 360 radial lines from the gauge center,
+    making it resistant to shadows and glare that can confuse edge detection.
     """
     cx, cy = center
-    
-    # Create annular mask (ring) for the gauge area
-    # Exclude center (needle pivot) and outer edge
-    mask = np.zeros(image.shape[:2], dtype=np.uint8)
-    cv2.circle(mask, (cx, cy), int(radius * 0.85), 255, -1)
-    cv2.circle(mask, (cx, cy), int(radius * 0.15), 0, -1)
-    
-    # Convert to grayscale for edge detection
+
+    # Convert to grayscale
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    
-    # Try multiple edge detection strategies for robustness
-    edges_list = [
-        cv2.Canny(gray, 50, 150),   # Standard
-        cv2.Canny(gray, 30, 100),   # More sensitive
-        cv2.Canny(gray, 70, 200),   # Less sensitive (cleaner)
-    ]
-    
-    best_angle = None
-    best_score = -1
-    
-    for edges in edges_list:
-        # Apply mask to focus only on gauge area
-        edges_masked = cv2.bitwise_and(edges, mask)
-        
-        # Detect line segments with relaxed parameters
-        lines = cv2.HoughLinesP(
-            edges_masked,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=10,  # Lower threshold for better detection
-            minLineLength=int(radius * 0.25),  # Shorter minimum
-            maxLineGap=10
-        )
-        
-        if lines is None:
-            continue
-        
-        # Find the line that passes closest to the center
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            
-            # Calculate perpendicular distance from center to line
-            distance = point_to_line_distance((cx, cy), (x1, y1), (x2, y2))
-            
-            # Check that line is reasonably long
-            line_length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-            
-            # Score based on: close to center + reasonably long
-            if line_length > radius * 0.3:
-                score = line_length / (distance + 1)  # Higher score = better
-                
-                if score > best_score:
-                    best_score = score
-                    
-                    # Determine which endpoint is farther from center (needle tip)
-                    dist1 = np.sqrt((x1 - cx)**2 + (y1 - cy)**2)
-                    dist2 = np.sqrt((x2 - cx)**2 + (y2 - cy)**2)
-                    
-                    if dist1 > dist2:
-                        tip_x, tip_y = x1, y1
-                    else:
-                        tip_x, tip_y = x2, y2
-                    
-                    # Calculate angle from center to tip
-                    angle_rad = np.arctan2(tip_y - cy, tip_x - cx)
-                    angle_deg = np.degrees(angle_rad)
-                    
-                    # Convert to 0-360 range
-                    if angle_deg < 0:
-                        angle_deg += 360
-                    
-                    best_angle = angle_deg
-    
-    return best_angle
+
+    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    # This normalizes contrast across the image, helping with both dark and bright images
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    # Apply bilateral filter to reduce noise while keeping edges sharp
+    filtered = cv2.bilateralFilter(enhanced, 9, 75, 75)
+
+    # Sample angles around the circle (every degree)
+    angles = np.arange(0, 360, 1)
+    darkness_scores = []
+
+    # For each angle, measure darkness along a ray from center
+    for angle in angles:
+        angle_rad = np.radians(angle)
+        darkness_sum = 0.0
+        sample_count = 0
+
+        # Sample from 25% to 80% of radius (where needle should be visible)
+        # This avoids the center pivot and the outer gauge edge
+        for r in np.linspace(radius * 0.25, radius * 0.80, 18):
+            x = int(cx + r * np.cos(angle_rad))
+            y = int(cy + r * np.sin(angle_rad))
+
+            if 0 <= x < filtered.shape[1] and 0 <= y < filtered.shape[0]:
+                # Measure darkness (lower pixel value = darker = higher score)
+                darkness = 255 - int(filtered[y, x])
+                darkness_sum += darkness
+                sample_count += 1
+
+        if sample_count > 0:
+            avg_darkness = darkness_sum / sample_count
+            darkness_scores.append(avg_darkness)
+        else:
+            darkness_scores.append(0.0)
+
+    darkness_scores = np.array(darkness_scores)
+
+    # Smooth the scores to reduce noise
+    window_size = 5
+    smoothed = np.convolve(darkness_scores, np.ones(window_size)/window_size, mode='same')
+
+    # Calculate contrast
+    max_darkness = np.max(smoothed)
+    min_darkness = np.min(smoothed)
+    darkness_range = max_darkness - min_darkness
+
+    # Need sufficient contrast to detect needle
+    if darkness_range < 3:
+        return None
+
+    # Find the angle with maximum darkness
+    needle_angle_idx = np.argmax(smoothed)
+    needle_angle = angles[needle_angle_idx]
+
+    return float(needle_angle)
 
 
 def point_to_line_distance(point, line_start, line_end):
@@ -278,9 +265,13 @@ def point_to_line_distance(point, line_start, line_end):
 
 def angle_to_temperature(angle, calibration=None):
     """Convert a needle angle to temperature using calibration if available.
-    
-    Uses improved empirical calibration from pump_vision.py when no calibration
-    file exists, providing accurate readings for the standard gauge setup.
+
+    Uses empirical calibration when no calibration file exists:
+    - Reference point: 40°C at 90° (needle pointing straight up)
+    - Rate: 2.67° rotation per 1°C change
+
+    This calibration was determined from test images and provides accurate
+    readings for the standard gauge setup with radial darkness detection.
     """
 
     if calibration:
@@ -303,23 +294,27 @@ def angle_to_temperature(angle, calibration=None):
 
         temperature = min_temp + (relative_angle / arc_span) * temp_range
     else:
-        # Use empirical calibration from pump_vision.py analysis
-        # The needle rotates clockwise starting from ~126° (0°C),
-        # going through 180°, 270°, 0°/360°, ending at ~67° (80°C)
-        # This represents approximately 3.77° per degree Celsius
-        EMPIRICAL_ZERO_ANGLE = 126.0
-        EMPIRICAL_DEGREES_PER_C = 3.77
-        
-        # Calculate how many degrees we've rotated from zero position
-        degrees_from_zero = angle - EMPIRICAL_ZERO_ANGLE
-        
-        # Handle wraparound: if we've gone past 360° back to small angles,
-        # we need to add 360 to get the total rotation
-        if degrees_from_zero < -180:  # We've wrapped around
-            degrees_from_zero += 360
-        
-        # Convert rotation to temperature
-        temperature = degrees_from_zero / EMPIRICAL_DEGREES_PER_C
+        # Empirical calibration from test image analysis
+        # Reference: 40°C at 90° (needle straight up)
+        # Rate: approximately 2.67° per degree Celsius
+        TEMP_REFERENCE = 40.0
+        ANGLE_REFERENCE = 90.0
+        DEGREES_PER_CELSIUS = 2.67
+
+        # Calculate angular difference from reference
+        angle_diff = angle - ANGLE_REFERENCE
+
+        # Handle wraparound: if angle difference is > 180°, we went the wrong way around
+        if angle_diff > 180:
+            angle_diff -= 360
+        elif angle_diff < -180:
+            angle_diff += 360
+
+        # Convert angle difference to temperature difference
+        temp_diff = angle_diff / DEGREES_PER_CELSIUS
+
+        # Calculate actual temperature
+        temperature = TEMP_REFERENCE + temp_diff
 
     temperature = max(GAUGE_MIN_TEMP, min(GAUGE_MAX_TEMP, temperature))
     return round(temperature, 1)

@@ -35,22 +35,26 @@ def test_angle_to_temperature_with_calibration():
 def test_angle_to_temperature_no_calibration():
     """Test angle to temperature without calibration (empirical)."""
     from pump_monitor import angle_to_temperature
-    
-    # Test known empirical mappings
-    # 126° = 0°C
-    temp = angle_to_temperature(126.0, None)
-    assert temp == pytest.approx(0.0, abs=1.0)
-    
-    # ~164° = 10°C (126 + 10*3.77 = 163.7)
-    temp = angle_to_temperature(164.0, None)
-    assert temp == pytest.approx(10.0, abs=1.5)
-    
-    # Test wraparound: ~67° = 80°C
-    # 67° is before 126°, so degrees_from_zero = 67 - 126 = -59
-    # Since -59 > -180, no wraparound adjustment happens
-    # So we get negative temperature, which gets clamped to min temp
-    temp = angle_to_temperature(67.0, None)
-    assert temp == pytest.approx(0.0, abs=0.1)  # Clamped to minimum
+
+    # Test new empirical calibration
+    # Reference: 40°C at 90°, rate: 2.67° per °C
+
+    # At reference angle (90° = 40°C)
+    temp = angle_to_temperature(90.0, None)
+    assert temp == pytest.approx(40.0, abs=0.1)
+
+    # 10°C below reference: 90° - (10 * 2.67) = 90° - 26.7° = 63.3°
+    temp = angle_to_temperature(63.0, None)
+    assert temp == pytest.approx(30.0, abs=1.5)
+
+    # 10°C above reference: 90° + (10 * 2.67) = 90° + 26.7° = 116.7°
+    temp = angle_to_temperature(117.0, None)
+    assert temp == pytest.approx(50.0, abs=1.5)
+
+    # Test wraparound for low temperatures
+    # 0°C = 90° - (40 * 2.67) = 90° - 106.8° = -16.8° = 343.2° (wrapped)
+    temp = angle_to_temperature(343.0, None)
+    assert temp == pytest.approx(0.0, abs=1.5)
 
 
 def test_angle_to_temperature_clamping():

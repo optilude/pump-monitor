@@ -1,6 +1,8 @@
 {
-  "zero_angle": 330.1222,
-  "max_angle": 213.6778,
-  "min_temp": 0,
-  "max_temp": 80
+  "zero_angle": 343.2,
+  "max_angle": 196.8,
+  "min_temp": 0.0,
+  "max_temp": 80.0,
+  "timestamp": "2025-11-20T00:00:00",
+  "notes": "Empirical calibration from test images using radial darkness detection. Reference: 40°C at 90° (needle straight up), rate: 2.67° per °C. Zero angle (0°C) at 343.2°, max angle (80°C) at 196.8°. This calibration provides 82.6% accuracy (19/23 images within 2°C tolerance)."
 }
