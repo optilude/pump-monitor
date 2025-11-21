@@ -1097,17 +1097,34 @@ def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, not
         elif temperature_c is not None and temp_confidence != MIN_TEMP_CONFIDENCE:
             log(f"Skipping temperature publish: confidence={temp_confidence}, temp={temperature_c}°C (required: {MIN_TEMP_CONFIDENCE})")
 
-        # Publish temperature validity indicator for Home Assistant
+        # Publish temperature published indicator for Home Assistant
         publish_calls.append(
             client.publish(
-                f"{MQTT_TOPIC_PREFIX}/temperature_valid",
+                f"{MQTT_TOPIC_PREFIX}/temperature_published",
                 "true" if temperature_published else "false",
                 retain=True,
             )
         )
 
+        # Determine if reading failed (detection issues, not scheduled skips)
+        # Failed when:
+        # 1. LED confidence abnormally low (< 5%), OR
+        # 2. Temperature was checked this cycle AND failed (confidence not high)
+        led_failed = led_confidence < 5.0
+        temp_failed = temp_confidence is not None and temp_confidence != MIN_TEMP_CONFIDENCE
+        reading_failed = led_failed or temp_failed
+
+        publish_calls.append(
+            client.publish(
+                f"{MQTT_TOPIC_PREFIX}/reading_failed",
+                "true" if reading_failed else "false",
+                retain=True,
+            )
+        )
+
         # Publish availability status
-        is_available = temperature_published or (temperature_c is None and temp_confidence is not None)
+        # Online unless there's a real problem (low confidence detection)
+        is_available = not reading_failed
         publish_calls.append(
             client.publish(
                 f"{MQTT_TOPIC_PREFIX}/available",
@@ -1177,7 +1194,7 @@ def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, not
         client.disconnect()
         connected = False
 
-        log(f"Published to MQTT: pump={'on' if pump_on else 'off'}, temp={temperature_c}°C (valid: {temperature_published})")
+        log(f"Published to MQTT: pump={'on' if pump_on else 'off'}, temp={temperature_c}°C (published: {temperature_published})")
 
     except Exception as e:
         log(f"MQTT error: {e}")

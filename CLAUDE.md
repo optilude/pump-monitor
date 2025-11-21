@@ -40,7 +40,9 @@ Multi-layered settings ([apply_pump_settings():652-659](pump_monitor.py#L652-L65
 Confidence-gated publishing ([publish_to_mqtt():1041-1188](pump_monitor.py#L1041-L1188)):
 - Temperature only published when confidence is "high"
 - Pump status requires minimum LED confidence (10%)
-- Publishes `temperature_valid` topic for Home Assistant availability
+- Publishes `temperature_published` topic indicating if temp was published this cycle
+- Publishes `reading_failed` topic indicating LED or temperature detection failures
+- Publishes `available` topic (online unless detection failed) for Home Assistant availability
 - Publishes `detection_quality` JSON with diagnostic metrics
 - Low-confidence readings logged but not sent to HA
 

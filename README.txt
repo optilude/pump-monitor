@@ -294,8 +294,9 @@ The system includes safeguards to prevent spurious readings:
 - Low-confidence readings are logged but not sent to Home Assistant
 
 **Validity Indicators:**
-- `/temperature_valid` - Boolean indicating if current temperature is trustworthy
-- `/available` - Sensor availability status for Home Assistant
+- `/temperature_published` - Boolean indicating if temperature was published this cycle
+- `/reading_failed` - Boolean indicating if LED or temperature detection failed
+- `/available` - Sensor availability status (online unless detection failed)
 - `/detection_quality` - Detailed metrics for troubleshooting
 
 **Detection Quality Metrics:**
@@ -510,8 +511,8 @@ mqtt:
     # Temperature reading with availability
     - name: "Pump Temperature"
       state_topic: "home/pump/temperature"
-      availability_topic: "home/pump/temperature_valid"
-      availability_template: "{{ value == 'true' }}"
+      availability_topic: "home/pump/available"
+      availability_template: "{{ value == 'online' }}"
       unit_of_measurement: "°C"
       device_class: temperature
       state_class: measurement
@@ -804,8 +805,8 @@ mqtt:
     # Temperature with availability indicator
     - name: "Pump Temperature"
       state_topic: "home/pump/temperature"
-      availability_topic: "home/pump/temperature_valid"
-      availability_template: "{{ value == 'true' }}"
+      availability_topic: "home/pump/available"
+      availability_template: "{{ value == 'online' }}"
       unit_of_measurement: "°C"
       device_class: temperature
       state_class: measurement
@@ -1754,8 +1755,9 @@ cat gauge_calibration.json                               # View calibration
 - `home/pump/notes` - Diagnostic information
 
 **Reliability topics:**
-- `home/pump/temperature_valid` - Boolean indicating if temperature is trustworthy (true/false)
-- `home/pump/available` - Sensor availability status (online/offline)
+- `home/pump/temperature_published` - Boolean indicating if temperature was published this cycle (true/false)
+- `home/pump/reading_failed` - Boolean indicating if LED or temperature detection failed (true/false)
+- `home/pump/available` - Sensor availability status; online unless detection failed (online/offline)
 - `home/pump/detection_quality` - JSON with detection metrics for troubleshooting
 
 ## Success Checklist
