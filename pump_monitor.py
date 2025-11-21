@@ -1308,17 +1308,11 @@ def run_monitoring_cycle(camera, state, calibration):
             # Save image when temperature is checked
             save_image(image, timestamp, suffix="_temp")
         else:
-            # Save LED check image for debugging if detection failed or occasionally
-            # Always save when LED confidence is suspiciously low (potential hardware issue)
-            should_save_led_image = (
-                led_confidence < 5.0 or  # Detection failure - save for debugging
-                timestamp.minute % 15 == 0  # Regular periodic save
-            )
-            if should_save_led_image:
-                suffix = "_led_failure" if led_confidence < 5.0 else "_led"
-                save_image(image, timestamp, suffix=suffix)
-                if led_confidence < 5.0:
-                    log(f"Saved diagnostic image due to low LED confidence ({led_confidence:.1f}%)")
+            # Always save LED check image (36-hour retention provides diagnostic history)
+            suffix = "_led_failure" if led_confidence < 5.0 else "_led"
+            save_image(image, timestamp, suffix=suffix)
+            if led_confidence < 5.0:
+                log(f"Saved diagnostic image due to low LED confidence ({led_confidence:.1f}%)")
 
         # Publish to Home Assistant
         log("Publishing to Home Assistant...")

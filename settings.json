@@ -18,7 +18,7 @@
     "led_check_interval_seconds": 300,
     "temp_check_interval_pump_on": 300,
     "temp_check_interval_pump_off": 1800,
-    "image_retention_hours": 4
+    "image_retention_hours": 36
   },
   "storage": {
     "image_dir": "images",
