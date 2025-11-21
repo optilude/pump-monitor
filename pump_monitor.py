@@ -1045,7 +1045,13 @@ def publish_to_mqtt(pump_on, temperature_c, led_confidence, temp_confidence, not
     connected = False
 
     try:
-        client = mqtt.Client(client_id="pump_monitor", protocol=mqtt.MQTTv311)
+        # Support both paho-mqtt v1.x and v2.x APIs
+        try:
+            # paho-mqtt v2.0+ requires CallbackAPIVersion
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="pump_monitor", protocol=mqtt.MQTTv311)
+        except (AttributeError, TypeError):
+            # paho-mqtt v1.x uses old API
+            client = mqtt.Client(client_id="pump_monitor", protocol=mqtt.MQTTv311)
 
         if MQTT_USER and MQTT_PASS:
             client.username_pw_set(MQTT_USER, MQTT_PASS)
@@ -1259,7 +1265,12 @@ def run_monitoring_cycle(camera, state, calibration):
         elif previous_region:
             state['led_region'] = None
             log("LED region cleared")
-        
+
+        # Warn about potential hardware issues
+        if led_confidence < 5.0:
+            log("WARNING: Very low LED detection confidence - possible camera/IR LED issue!")
+            log("Check: 1) Camera connection, 2) IR LED GPIO pins 26/27, 3) Physical LED status")
+
         # Update pump status in state
         state['pump_on'] = led_on
         
@@ -1297,9 +1308,17 @@ def run_monitoring_cycle(camera, state, calibration):
             # Save image when temperature is checked
             save_image(image, timestamp, suffix="_temp")
         else:
-            # Save LED check image occasionally (every 15 minutes)
-            if timestamp.minute % 15 == 0:
-                save_image(image, timestamp, suffix="_led")
+            # Save LED check image for debugging if detection failed or occasionally
+            # Always save when LED confidence is suspiciously low (potential hardware issue)
+            should_save_led_image = (
+                led_confidence < 5.0 or  # Detection failure - save for debugging
+                timestamp.minute % 15 == 0  # Regular periodic save
+            )
+            if should_save_led_image:
+                suffix = "_led_failure" if led_confidence < 5.0 else "_led"
+                save_image(image, timestamp, suffix=suffix)
+                if led_confidence < 5.0:
+                    log(f"Saved diagnostic image due to low LED confidence ({led_confidence:.1f}%)")
 
         # Publish to Home Assistant
         log("Publishing to Home Assistant...")
