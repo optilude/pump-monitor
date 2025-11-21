@@ -100,3 +100,6 @@ dmypy.json
 # VS Code
 .vscode/
 .claude/settings.local.json
+
+# Copies of images from live 
+remote-images/**
